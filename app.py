@@ -2,7 +2,7 @@ import os
 import requests
 from flask import Flask, request, jsonify
 from google import genai 
-  
+
 app = Flask(__name__)
 
 # 🔑 جلب المفتاحات من متغيرات البيئة (Environment Variables)
@@ -12,6 +12,9 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_academy_secret_token_123")
 
 # تهيئة عميل Gemini API
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# 🧠 قاموس لتخزين سياق وتاريخ المحادثة لكل مستخدم بناءً على sender_id
+user_conversations = {}
 
 # 🧠 القواعد والتعليمات البرمجية الكاملة
 SYSTEM_INSTRUCTION = """
@@ -108,21 +111,45 @@ def handle_messages():
                     user_text = messaging_event["message"].get("text", "")
 
                     if user_text:
-                        # توليد الرد من الذكاء الاصطناعي Gemini
-                        ai_response = generate_ai_reply(user_text)
+                        # توليد الرد من الذكاء الاصطناعي Gemini مع تمرير ID العميل لحفظ التاريخ
+                        ai_response = generate_ai_reply(sender_id, user_text)
                         # إرسال الرد إلى العميل على ماسنجر
                         send_facebook_message(sender_id, ai_response)
 
     return "EVENT_RECEIVED", 200
 
-def generate_ai_reply(user_message):
+def generate_ai_reply(sender_id, user_message):
     try:
+        # إنشاء قائمة المحادثة للمستخدم إن لم تكن موجودة
+        if sender_id not in user_conversations:
+            user_conversations[sender_id] = []
+
+        # إضافة رسالة المستخدم الجديدة للذاكرة
+        user_conversations[sender_id].append({
+            "role": "user",
+            "parts": [{"text": user_message}]
+        })
+
+        # الاحتفاظ بآخر 12 رسالة فقط للتحكم في حجم الذاكرة والأداء
+        if len(user_conversations[sender_id]) > 12:
+            user_conversations[sender_id] = user_conversations[sender_id][-12:]
+
+        # توليد الرد بناءً على المحادثة السابقة كاملة
         response = ai_client.models.generate_content(
             model='gemini-3.5-flash-lite',
-            contents=user_message,
+            contents=user_conversations[sender_id],
             config={'system_instruction': SYSTEM_INSTRUCTION}
         )
-        return response.text
+
+        reply_text = response.text
+
+        # حفظ رد الذكاء الاصطناعي في الذاكرة لاستمرار المحادثة
+        user_conversations[sender_id].append({
+            "role": "model",
+            "parts": [{"text": reply_text}]
+        })
+
+        return reply_text
     except Exception as e:
         print(f"Error in Gemini API: {e}")
         return "أهلاً بك! يمكنك التواصل مع إدارة الأكاديمية مباشرة على الرقم: 0932775583"
