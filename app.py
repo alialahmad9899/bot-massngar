@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import requests
 from flask import Flask, request, jsonify
 from google import genai 
@@ -13,8 +14,85 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_academy_secret_token_123")
 # تهيئة عميل Gemini API
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 🧠 قاموس لتخزين سياق وتاريخ المحادثة لكل مستخدم بناءً على sender_id
-user_conversations = {}
+# 🗄️ إعداد وقواعد بيانات SQLite للحفاظ على المحادثات وحالة التوقف
+DB_PATH = "academy_bot.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id TEXT,
+            role TEXT,
+            content TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS human_handover (
+            sender_id TEXT PRIMARY KEY,
+            is_paused INTEGER DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# تهيئة قاعدة البيانات عند بدء التشغيل
+init_db()
+
+def get_user_history_db(sender_id, limit=12):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT role, content FROM (
+            SELECT role, content, id FROM conversations 
+            WHERE sender_id = ? 
+            ORDER BY id DESC LIMIT ?
+        ) ORDER BY id ASC
+    ''', (sender_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    history = []
+    for role, content in rows:
+        history.append({
+            "role": role,
+            "parts": [{"text": content}]
+        })
+    return history
+
+def save_message_db(sender_id, role, content):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO conversations (sender_id, role, content)
+        VALUES (?, ?, ?)
+    ''', (sender_id, role, content))
+    conn.commit()
+    conn.close()
+
+def set_handover_status(sender_id, status=1):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO human_handover (sender_id, is_paused)
+        VALUES (?, ?)
+        ON CONFLICT(sender_id) DO UPDATE SET is_paused = ?, updated_at = CURRENT_TIMESTAMP
+    ''', (sender_id, status, status))
+    conn.commit()
+    conn.close()
+
+def is_user_paused(sender_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT is_paused FROM human_handover WHERE sender_id = ?
+    ''', (sender_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] == 1 if row else False
 
 # 🧠 التعليمات البرمجية المعدلة بالكامل وفق التوجيهات الجديدة
 SYSTEM_INSTRUCTION = """
@@ -110,61 +188,109 @@ def handle_messages():
     if data.get("object") == "page":
         for entry in data.get("entry", []):
             for messaging_event in entry.get("messaging", []):
-                # إذا كانت الأحداث تشمل رسالة نصية
                 if messaging_event.get("message") and not messaging_event["message"].get("is_echo"):
                     sender_id = messaging_event["sender"]["id"]
                     user_text = messaging_event["message"].get("text", "")
 
                     if user_text:
-                        # توليد الرد من الذكاء الاصطناعي Gemini مع تمرير ID العميل لحفظ التاريخ
-                        ai_response = generate_ai_reply(sender_id, user_text)
-                        # إرسال الرد إلى العميل على ماسنجر
-                        send_facebook_message(sender_id, ai_response)
+                        # 1️⃣ إرسال مؤشر جاري الكتابة فوراً
+                        send_typing_indicator(sender_id)
+
+                        # كلمات التحويل لموظف وإعادة التفعيل
+                        handover_keywords = ["موظف", "مدير", "بشري", "تواصل مباشر", "احكي مع حدا", "أحكي مع حدا", "تحدث مع انسان"]
+                        unpause_keywords = ["تشغيل البوت", "تفعيل البوت", "إعادة البوت", "اعادة البوت"]
+
+                        # 2️⃣ التحقق من خيار إعادة تفعيل البوت
+                        if any(kw in user_text for kw in unpause_keywords):
+                            set_handover_status(sender_id, status=0)
+                            send_facebook_message(sender_id, "تم تفعيل الرد التلقائي للبوت بنجاح! تفضلي كيف بقدر أساعدك؟")
+
+                        # 3️⃣ التحقق مما إذا كان المستخدم مسبقاً في وضع التحويل البشري
+                        elif is_user_paused(sender_id):
+                            pass
+
+                        # 4️⃣ التحقق من طلب التحويل لموظف بشري
+                        elif any(kw in user_text for kw in handover_keywords):
+                            set_handover_status(sender_id, status=1)
+                            send_facebook_message(sender_id, "تم تحويل طلبك لموظف المتابعة الإدارية وسيقوم أحد أعضاء الفريق بالرد عليكِ في أقرب وقت. (لتفعيل البوت مجدداً يمكنكِ إرسال: تشغيل البوت)")
+
+                        # 5️⃣ معالجة الرسالة الطبيعية عبر البوت الذكي
+                        else:
+                            ai_response = generate_ai_reply(sender_id, user_text)
+                            quick_replies = determine_quick_replies(ai_response)
+                            send_facebook_message(sender_id, ai_response, quick_replies)
 
     return "EVENT_RECEIVED", 200
 
 def generate_ai_reply(sender_id, user_message):
     try:
-        # إنشاء قائمة المحادثة للمستخدم إن لم تكن موجودة
-        if sender_id not in user_conversations:
-            user_conversations[sender_id] = []
+        # حفظ رسالة المستخدم في قاعدة البيانات
+        save_message_db(sender_id, "user", user_message)
 
-        # إضافة رسالة المستخدم الجديدة للذاكرة
-        user_conversations[sender_id].append({
-            "role": "user",
-            "parts": [{"text": user_message}]
-        })
+        # جلب تاريخ المحادثة من قاعدة البيانات
+        conversation_history = get_user_history_db(sender_id, limit=12)
 
-        # الاحتفاظ بآخر 12 رسالة فقط للتحكم في حجم الذاكرة والأداء
-        if len(user_conversations[sender_id]) > 12:
-            user_conversations[sender_id] = user_conversations[sender_id][-12:]
-
-        # توليد الرد بناءً على المحادثة السابقة كاملة
+        # توليد الرد من الذكاء الاصطناعي
         response = ai_client.models.generate_content(
             model='gemini-3.5-flash-lite',
-            contents=user_conversations[sender_id],
+            contents=conversation_history,
             config={'system_instruction': SYSTEM_INSTRUCTION}
         )
 
         reply_text = response.text
 
-        # حفظ رد الذكاء الاصطناعي في الذاكرة لاستمرار المحادثة
-        user_conversations[sender_id].append({
-            "role": "model",
-            "parts": [{"text": reply_text}]
-        })
+        # حفظ رد الذكاء الاصطناعي في قاعدة البيانات
+        save_message_db(sender_id, "model", reply_text)
 
         return reply_text
     except Exception as e:
         print(f"Error in Gemini API: {e}")
         return "أهلاً بك! يمكنك التواصل مع إدارة الأكاديمية مباشرة على الرقم: 0932775583"
 
-def send_facebook_message(recipient_id, message_text):
+def determine_quick_replies(reply_text):
+    """دالة لإنشاء أزرار سريعة تفاعلية بناءً على سياق الرد"""
+    if "شو حابة تعرفي" in reply_text or "شو حابب تعرف" in reply_text or "تسهيلات الدفع" in reply_text:
+        return [
+            {"content_type": "text", "title": "السعر وتسهيلات الدفع", "payload": "PRICE"},
+            {"content_type": "text", "title": "المحاور والدروس", "payload": "SYLLABUS"},
+            {"content_type": "text", "title": "أوقات الدوام", "payload": "TIMING"}
+        ]
+    elif "المحاور والدروس" in reply_text or "المحاور التفصيلية" in reply_text:
+        return [
+            {"content_type": "text", "title": "المحاور والدروس", "payload": "SYLLABUS"},
+            {"content_type": "text", "title": "تفاصيل الشهادة", "payload": "CERTIFICATE"},
+            {"content_type": "text", "title": "عنوان المركز", "payload": "LOCATION"}
+        ]
+    elif "عنوان" in reply_text or "موقع" in reply_text or "الشهادات" in reply_text:
+        return [
+            {"content_type": "text", "title": "عنوان المركز والتثبيت", "payload": "LOCATION"},
+            {"content_type": "text", "title": "تواصل مع الإدارة", "payload": "HUMAN_HANDOVER"}
+        ]
+    return None
+
+def send_typing_indicator(recipient_id):
+    """إرسال إشارة جاري الكتابة في ماسنجر"""
+    url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    payload = {
+        "recipient": {"id": recipient_id},
+        "sender_action": "typing_on"
+    }
+    headers = {"Content-Type": "application/json"}
+    try:
+        requests.post(url, json=payload, headers=headers)
+    except Exception as e:
+        print(f"Failed to send typing indicator: {e}")
+
+def send_facebook_message(recipient_id, message_text, quick_replies=None):
+    """إرسال النص والأزرار السريعة للمستخدم في ماسنجر"""
     url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
     payload = {
         "recipient": {"id": recipient_id},
         "message": {"text": message_text}
     }
+    if quick_replies:
+        payload["message"]["quick_replies"] = quick_replies
+
     headers = {"Content-Type": "application/json"}
     
     try:
