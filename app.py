@@ -52,6 +52,7 @@ EVENT_MAX_RETRIES = 5
 EVENT_STALE_PROCESSING_SECONDS = 10 * 60
 FACEBOOK_TIMEOUT_SECONDS = 8
 FACEBOOK_RETRY_ATTEMPTS = 3
+AUTO_START_WORKERS = os.environ.get("BOT_AUTO_START_WORKERS", "1") == "1"
 
 # ========================================================
 # 🧠 Gemini client
@@ -222,8 +223,10 @@ def enqueue_webhook_event(sender_id: str, message_id: Optional[str], payload: di
             conn.close()
 
     if event_id is not None:
+        print(f"[QUEUE] persisted event_id={event_id} sender={sender_id} mid={message_id}", flush=True)
         try:
             MESSAGE_QUEUE.put_nowait(event_id)
+            print(f"[QUEUE] enqueued event_id={event_id} size={MESSAGE_QUEUE.qsize()}", flush=True)
         except queue.Full:
             # Revert to pending so the DB-backed poller can pick it up later.
             with DB_LOCK:
@@ -236,6 +239,7 @@ def enqueue_webhook_event(sender_id: str, message_id: Optional[str], payload: di
                     conn.commit()
                 finally:
                     conn.close()
+            print(f"[QUEUE] RAM queue full; event_id={event_id} left in DB for poller", flush=True)
     return event_id
 
 
@@ -247,7 +251,7 @@ def claim_next_pending_event() -> Optional[int]:
             row = conn.execute(
                 """
                 SELECT id FROM webhook_events
-                WHERE status='pending' AND available_at <= ?
+                WHERE status IN ('pending', 'queued') AND available_at <= ?
                 ORDER BY id ASC
                 LIMIT 1
                 """,
@@ -261,7 +265,7 @@ def claim_next_pending_event() -> Optional[int]:
                 """
                 UPDATE webhook_events
                 SET status='processing', claimed_at=?
-                WHERE id=? AND status='pending'
+                WHERE id=? AND status IN ('pending', 'queued')
                 """,
                 (time.time(), event_id),
             ).rowcount
@@ -279,7 +283,11 @@ def load_event(event_id: int):
         conn = get_db_connection()
         try:
             row = conn.execute(
-                "SELECT id, sender_id, payload, retries FROM webhook_events WHERE id=?",
+                """
+                SELECT id, sender_id, payload, retries, response_text, response_quick_replies
+                FROM webhook_events
+                WHERE id=?
+                """,
                 (event_id,),
             ).fetchone()
             if not row:
@@ -292,6 +300,27 @@ def load_event(event_id: int):
                 "response_text": row[4],
                 "response_quick_replies": json.loads(row[5]) if row[5] else None,
             }
+        finally:
+            conn.close()
+
+
+def claim_queued_or_pending_event(event_id: int) -> bool:
+    """Atomically claim an event already queued in RAM or left pending in DB."""
+    with DB_LOCK:
+        conn = get_db_connection()
+        try:
+            claimed = bool(
+                conn.execute(
+                    """
+                    UPDATE webhook_events
+                    SET status='processing', claimed_at=?
+                    WHERE id=? AND status IN ('queued', 'pending')
+                    """,
+                    (time.time(), event_id),
+                ).rowcount
+            )
+            conn.commit()
+            return claimed
         finally:
             conn.close()
 
@@ -864,6 +893,7 @@ def process_single_message(event_payload, event_id=None):
 # 🔄 Worker pool: bounded RAM, DB-backed pending events
 # ========================================================
 def process_event_record(event_id: int):
+    print(f"[EVENT] loading event_id={event_id}", flush=True)
     event = load_event(event_id)
     if not event:
         mark_event_completed(event_id)
@@ -878,71 +908,69 @@ def process_event_record(event_id: int):
             ):
                 raise RuntimeError("Failed to redeliver stored response to Facebook")
         else:
+            print(f"[EVENT] processing event_id={event_id}", flush=True)
             process_single_message(event["payload"], event_id=event_id)
         mark_event_completed(event_id)
+        print(f"[EVENT] completed event_id={event_id}", flush=True)
     except Exception as exc:
         print(f"Event {event_id} failed: {exc}")
         mark_event_failed(event_id, str(exc), retryable=True)
 
 
-def worker_loop(worker_number: int):
-    while not STOP_EVENT.is_set():
-        event_id = None
+def worker_iteration(timeout=0.5):
+    """Process at most one event. RAM-queued events are claimed once; DB-recovered events are already claimed."""
+    event_id = None
+    from_queue = False
+    try:
         try:
-            event_id = MESSAGE_QUEUE.get(timeout=0.5)
+            event_id = MESSAGE_QUEUE.get(timeout=timeout)
+            from_queue = True
         except queue.Empty:
+            # This function atomically changes pending/queued -> processing.
             event_id = claim_next_pending_event()
 
         if event_id is None:
-            continue
+            return None
 
-        # Queue item may already have been claimed by a polling worker.
-        with DB_LOCK:
-            conn = get_db_connection()
+        if from_queue:
+            # A freshly enqueued event is still queued in SQLite. This is the one and only
+            # claim for the RAM-queue path. Do not claim a second time.
+            if not claim_queued_or_pending_event(event_id):
+                print(f"[WORKER] event_id={event_id} was already claimed; skipping", flush=True)
+                return None
+        # For the DB-recovery path, claim_next_pending_event() already set processing.
+
+        print(f"[WORKER] claimed event_id={event_id} source={'ram' if from_queue else 'db'}", flush=True)
+        process_event_record(event_id)
+        return event_id
+    except Exception as exc:
+        print(f"[WORKER] iteration error: {type(exc).__name__}: {exc}", flush=True)
+        if event_id is not None:
             try:
-                row = conn.execute(
-                    "SELECT status FROM webhook_events WHERE id=?",
-                    (event_id,),
-                ).fetchone()
-            finally:
-                conn.close()
-        if not row or row[0] not in {"queued", "processing"}:
-            MESSAGE_QUEUE.task_done()
-            continue
-
-        # Queue items are initially marked queued. Transition to processing exactly once.
-        if row[0] == "queued":
-            claimed = False
-            with DB_LOCK:
-                conn = get_db_connection()
-                try:
-                    claimed = bool(
-                        conn.execute(
-                            """
-                            UPDATE webhook_events
-                            SET status='processing', claimed_at=?
-                            WHERE id=? AND status='pending'
-                            """,
-                            (time.time(), event_id),
-                        ).rowcount
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-            if not claimed:
+                mark_event_failed(event_id, str(exc), retryable=True)
+            except Exception as mark_exc:
+                print(f"[WORKER] failed to mark event_id={event_id}: {type(mark_exc).__name__}: {mark_exc}", flush=True)
+        return None
+    finally:
+        if from_queue:
+            try:
                 MESSAGE_QUEUE.task_done()
-                continue
+            except ValueError:
+                pass
 
-        try:
-            process_event_record(event_id)
-        finally:
-            MESSAGE_QUEUE.task_done()
+
+def worker_loop(worker_number: int):
+    print(f"[WORKER-{worker_number}] started", flush=True)
+    while not STOP_EVENT.is_set():
+        worker_iteration(timeout=0.5)
+    print(f"[WORKER-{worker_number}] stopped", flush=True)
 
 
 def start_workers():
     reset_stale_processing_events()
     if WORKERS:
         return
+    print(f"[STARTUP] starting {WORKER_COUNT} worker(s), queue_max={MESSAGE_QUEUE_MAXSIZE}", flush=True)
     for i in range(WORKER_COUNT):
         thread = threading.Thread(
             target=worker_loop,
@@ -990,7 +1018,9 @@ def handle_messages():
                     continue
                 message_id = messaging_event.get("message", {}).get("mid")
                 if message_id and is_duplicate_message(message_id):
+                    print(f"[WEBHOOK] duplicate mid={message_id}", flush=True)
                     continue
+                print(f"[WEBHOOK] received sender={sender_id} mid={message_id}", flush=True)
                 enqueue_webhook_event(sender_id, message_id, messaging_event)
 
     return "EVENT_RECEIVED", 200
@@ -1000,7 +1030,10 @@ def handle_messages():
 # 🚀 Startup
 # ========================================================
 init_db()
-start_workers()
+if AUTO_START_WORKERS:
+    start_workers()
+else:
+    print("[STARTUP] workers disabled by BOT_AUTO_START_WORKERS=0", flush=True)
 
 
 if __name__ == "__main__":
