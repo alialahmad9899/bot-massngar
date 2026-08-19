@@ -2,7 +2,7 @@ import os
 import requests
 from flask import Flask, request, jsonify
 from google import genai 
-
+  
 app = Flask(__name__)
 
 # 🔑 جلب المفتاحات من متغيرات البيئة (Environment Variables)
