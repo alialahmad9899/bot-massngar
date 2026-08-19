@@ -41,7 +41,6 @@ if _missing_env:
 DB_PATH = os.environ.get("DB_PATH", "academy_bot.db")
 MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-# Render 512 MB: keep memory bounded and concurrency intentionally small.
 WORKER_COUNT = max(1, min(int(os.environ.get("BOT_WORKERS", "2")), 2))
 MESSAGE_QUEUE_MAXSIZE = max(20, min(int(os.environ.get("MESSAGE_QUEUE_MAXSIZE", "100")), 200))
 USER_RATE_LIMIT_SECONDS = float(os.environ.get("USER_RATE_LIMIT_SECONDS", "1.0"))
@@ -69,7 +68,6 @@ ADMIN_ATTEMPTS_LOCK = threading.Lock()
 LAST_PROCESSED_TIME = {}
 LAST_PROCESSED_LOCK = threading.Lock()
 
-# Stripe locks avoid an unbounded dict of per-user Lock objects.
 USER_LOCK_COUNT = 32
 USER_LOCKS = [threading.Lock() for _ in range(USER_LOCK_COUNT)]
 
@@ -118,7 +116,6 @@ def init_db():
                 )
                 """
             )
-            # Backward-compatible migration for the older database schema.
             _ensure_column(conn, "conversations", "intent", "TEXT")
             _ensure_column(conn, "conversations", "message_id", "TEXT")
 
@@ -143,8 +140,6 @@ def init_db():
                 """
             )
 
-            # Durable local inbox. Render restarts still require a persistent disk
-            # for these rows to survive process/instance replacement.
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS webhook_events (
@@ -195,7 +190,6 @@ def reset_stale_processing_events():
 
 
 def enqueue_webhook_event(sender_id: str, message_id: Optional[str], payload: dict) -> Optional[int]:
-    """Persist first, enqueue second. This prevents loss when RAM queue is full."""
     raw_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with DB_LOCK:
         conn = get_db_connection()
@@ -225,7 +219,6 @@ def enqueue_webhook_event(sender_id: str, message_id: Optional[str], payload: di
         try:
             MESSAGE_QUEUE.put_nowait(event_id)
         except queue.Full:
-            # Revert to pending so the DB-backed poller can pick it up later.
             with DB_LOCK:
                 conn = get_db_connection()
                 try:
@@ -279,7 +272,7 @@ def load_event(event_id: int):
         conn = get_db_connection()
         try:
             row = conn.execute(
-                "SELECT id, sender_id, payload, retries FROM webhook_events WHERE id=?",
+                "SELECT id, sender_id, payload, retries, response_text, response_quick_replies FROM webhook_events WHERE id=?",
                 (event_id,),
             ).fetchone()
             if not row:
@@ -608,9 +601,6 @@ def wait_for_user_rate_limit(sender_id):
         now = time.time()
         last = LAST_PROCESSED_TIME.get(sender_id, 0.0)
         wait = max(0.0, USER_RATE_LIMIT_SECONDS - (now - last))
-        if wait:
-            # Marking happens after the wait, outside the lock, to avoid blocking others.
-            pass
     if wait:
         time.sleep(wait)
     with LAST_PROCESSED_LOCK:
@@ -708,7 +698,6 @@ def generate_ai_reply(sender_id, user_message, intent=None, is_admin=False, mess
                 "[مدير الأكاديمية]\n" + current_text
             )
 
-        # Keep the current message as the last user turn while retaining the existing history.
         contents = conversation_history[:-1] if conversation_history else []
         contents.append({"role": "user", "parts": [{"text": current_text}]})
 
@@ -776,16 +765,11 @@ def process_single_message(event_payload, event_id=None):
     if not user_text and not intent:
         return
 
-    # Deduplication is performed at Webhook ingestion. Retries from the durable inbox
-    # must be allowed to reach Facebook again after transient delivery failures.
-
-    # Per-user serialization keeps conversational history ordered.
     with get_user_lock(sender_id):
         wait_for_user_rate_limit(sender_id)
         send_typing_indicator(sender_id)
         admin_info = get_admin_status(sender_id)
 
-        # Admin password flow must be completed after explicit admin claim.
         if admin_info["awaiting_password"]:
             is_locked, time_left = check_admin_lockout(sender_id)
             if is_locked:
@@ -814,7 +798,6 @@ def process_single_message(event_payload, event_id=None):
                     raise RuntimeError("Failed to deliver admin failure message")
             return
 
-        # Explicit admin claim -> ask for password, do not grant privileges.
         if any(
             claim in user_text
             for claim in ["أنا المدير", "انا المدير", "صاحب المركز", "إدارة المركز", "ادارة المركز"]
@@ -824,7 +807,6 @@ def process_single_message(event_payload, event_id=None):
                 raise RuntimeError("Failed to deliver admin prompt")
             return
 
-        # Human handover controls are deterministic and do not consume Gemini.
         handover_keywords = ["موظف", "بشري", "تواصل مباشر", "احكي مع حدا", "أحكي مع حدا", "تحدث مع انسان"]
         unpause_keywords = ["تشغيل البوت", "تفعيل البوت", "إعادة البوت", "اعادة البوت"]
 
@@ -887,56 +869,57 @@ def process_event_record(event_id: int):
 
 def worker_loop(worker_number: int):
     while not STOP_EVENT.is_set():
-        event_id = None
         try:
-            event_id = MESSAGE_QUEUE.get(timeout=0.5)
-        except queue.Empty:
-            event_id = claim_next_pending_event()
-
-        if event_id is None:
-            continue
-
-        # Queue item may already have been claimed by a polling worker.
-        with DB_LOCK:
-            conn = get_db_connection()
+            event_id = None
             try:
-                row = conn.execute(
-                    "SELECT status FROM webhook_events WHERE id=?",
-                    (event_id,),
-                ).fetchone()
-            finally:
-                conn.close()
-        if not row or row[0] not in {"queued", "processing"}:
-            MESSAGE_QUEUE.task_done()
-            continue
+                event_id = MESSAGE_QUEUE.get(timeout=0.5)
+            except queue.Empty:
+                event_id = claim_next_pending_event()
 
-        # Queue items are initially marked queued. Transition to processing exactly once.
-        if row[0] == "queued":
-            claimed = False
+            if event_id is None:
+                continue
+
             with DB_LOCK:
                 conn = get_db_connection()
                 try:
-                    claimed = bool(
-                        conn.execute(
-                            """
-                            UPDATE webhook_events
-                            SET status='processing', claimed_at=?
-                            WHERE id=? AND status='pending'
-                            """,
-                            (time.time(), event_id),
-                        ).rowcount
-                    )
-                    conn.commit()
+                    row = conn.execute(
+                        "SELECT status FROM webhook_events WHERE id=?",
+                        (event_id,),
+                    ).fetchone()
                 finally:
                     conn.close()
-            if not claimed:
+            if not row or row[0] not in {"queued", "processing"}:
                 MESSAGE_QUEUE.task_done()
                 continue
 
-        try:
-            process_event_record(event_id)
-        finally:
-            MESSAGE_QUEUE.task_done()
+            if row[0] == "queued":
+                claimed = False
+                with DB_LOCK:
+                    conn = get_db_connection()
+                    try:
+                        claimed = bool(
+                            conn.execute(
+                                """
+                                UPDATE webhook_events
+                                SET status='processing', claimed_at=?
+                                WHERE id=? AND status='queued'
+                                """,
+                                (time.time(), event_id),
+                            ).rowcount
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                if not claimed:
+                    MESSAGE_QUEUE.task_done()
+                    continue
+
+            try:
+                process_event_record(event_id)
+            finally:
+                MESSAGE_QUEUE.task_done()
+        except Exception as exc:
+            print(f"Worker {worker_number} exception: {exc}")
 
 
 def start_workers():
@@ -974,7 +957,6 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def handle_messages():
-    # Signature verification is mandatory in production.
     if not verify_facebook_signature(request):
         return "Invalid Signature", 403
 
