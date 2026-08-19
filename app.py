@@ -14,7 +14,7 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_academy_secret_token_123")
 # تهيئة عميل Gemini API
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 🗄️ إعداد وقواعد بيانات SQLite للحفاظ على المحادثات وحالة التوقف
+# 🗄️ إعداد وقواعد بيانات SQLite للحفاظ على المحادثات وحالة التوقف والتحقق من المدير
 DB_PATH = "academy_bot.db"
 
 def init_db():
@@ -33,6 +33,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS human_handover (
             sender_id TEXT PRIMARY KEY,
             is_paused INTEGER DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS admin_users (
+            sender_id TEXT PRIMARY KEY,
+            is_admin INTEGER DEFAULT 0,
+            awaiting_password INTEGER DEFAULT 0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -94,6 +102,29 @@ def is_user_paused(sender_id):
     conn.close()
     return row[0] == 1 if row else False
 
+def set_admin_status(sender_id, is_admin=1, awaiting_password=0):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO admin_users (sender_id, is_admin, awaiting_password)
+        VALUES (?, ?, ?)
+        ON CONFLICT(sender_id) DO UPDATE SET is_admin = ?, awaiting_password = ?, updated_at = CURRENT_TIMESTAMP
+    ''', (sender_id, is_admin, awaiting_password, is_admin, awaiting_password))
+    conn.commit()
+    conn.close()
+
+def get_admin_status(sender_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT is_admin, awaiting_password FROM admin_users WHERE sender_id = ?
+    ''', (sender_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"is_admin": bool(row[0]), "awaiting_password": bool(row[1])}
+    return {"is_admin": False, "awaiting_password": False}
+
 # 🧠 التعليمات البرمجية المعدلة بالكامل وفق التوجيهات الجديدة واسلوب الاقناع المبيعاتي
 SYSTEM_INSTRUCTION = """
 أنت المساعد الذكي الرسمي لـ "الأكاديمية الدولية للتدريب المهني" في حمص.
@@ -111,6 +142,9 @@ SYSTEM_INSTRUCTION = """
 
 ⛔ توضيح صارم جداً لموضوع أدوات ومستحضرات التدريب (تجنباً لأي لبس):
 - **قاعدة الأدوات:** أدوات ومستحضرات الأجهزة والتدريب مؤمنة ومتاحة بالكامل داخل الأكاديمية لاستخدام الطالبة أثناء الدروس والتطبيق العملي في القاعة (وليس بمعنى إعطاء أدوات مجانية تأخذها الطالبة للمنزل). وضح هذا المعنى بعبارة: "أدوات ومواد التدريب موفرة بالكامل داخل الأكاديمية لاستخدامكِ أثناء الدروس".
+
+⛔ التحقق الأمني من المدير وصاحب المركز:
+- إذا أدعى المستخدم أنه المدير أو صاحب المركز وقام بإدخال كلمة السر الصحيحة (12341212)، خاطبه باحترام وتقدير إداري ("أهلاً بك مديرنا العزيز وصاحب المركز") وأجبه عن أي استفسارات أو تقارير إدارية كمدير للمركز.
 
 ⛔ قواعد الإقناع المبيعاتي وتدفق المحادثة (خطوة بخطوة):
 
@@ -140,8 +174,10 @@ SYSTEM_INSTRUCTION = """
    - إذا عبّرت عن خوفها من عدم إتقان الشغل أو سألت عن إمكانية الإعادة:
    - وضّحي لها أن الأكاديمية تضمن لها إتقان المهنة، وفي حال شعرتِ بعد الدورة بأنكِ بحاجة لإعادة أي درس أو محور تطبيقي، يمكنكِ إعادته مجاناً مع القاعة التالية بدون دفع أي ليرة إضافية حتى تخرجي متمكنة 100%.
 
-7. **عند طلب المحاور:**
-   اعرض المحاور بنقاط موجزة وسريعة، ثم اسألها: "تحبي أبعثلك تفاصيل الشهادات الرسمية أو عنوان المركز للتثبيت؟".
+7. **عند طلب المحاور (مهم جداً):**
+   اعرض المحاور بنقاط موجزة وسريعة، ووضّح في نهاية المحاور دائماً التنبيه التالي:
+   "(ملاحظة: هذه رؤوس أقلام والمحور الشامل تفصيلي جداً، ولكن يتعذر إرساله بالكامل لأن الرسالة ستكون طويلة جداً)".
+   ثم اسألها: "تحبي أبعثلك تفاصيل الشهادات الرسمية أو عنوان المركز للتثبيت؟".
 
 8. **عند طلب الأوقات والدوام أو مواعيد الاستقبال بالمركز:**
    - **مواعيد الاستقبال والتثبيت بالمركز:** المركز مفتوح يومياً للاستقبال والتسجيل والتثبيت من الساعة 10:30 صباحاً وحتى الساعة 5:00 مساءً.
@@ -215,29 +251,47 @@ def handle_messages():
                         # 1️⃣ إرسال مؤشر جاري الكتابة فوراً
                         send_typing_indicator(sender_id)
 
-                        # كلمات التحويل لموظف وإعادة التفعيل
-                        handover_keywords = ["موظف", "مدير", "بشري", "تواصل مباشر", "احكي مع حدا", "أحكي مع حدا", "تحدث مع انسان"]
-                        unpause_keywords = ["تشغيل البوت", "تفعيل البوت", "إعادة البوت", "اعادة البوت"]
+                        admin_info = get_admin_status(sender_id)
 
-                        # 2️⃣ التحقق من خيار إعادة تفعيل البوت
-                        if any(kw in user_text for kw in unpause_keywords):
+                        # 2️⃣ التحقق من إدخال كلمة السر الخاصة بالإدارة
+                        if user_text.strip() == "12341212":
+                            set_admin_status(sender_id, is_admin=1, awaiting_password=0)
                             set_handover_status(sender_id, status=0)
-                            send_facebook_message(sender_id, "تم تفعيل الرد التلقائي للبوت بنجاح! تفضلي كيف بقدر أساعدك؟")
+                            send_facebook_message(sender_id, "تم التحقق من كلمة السر بنجاح! أهلاً بك مديرنا العزيز وصاحب المركز. التفاعل الآن مخصص لحضرتك، كيف بقدر أساعدك اليوم؟")
 
-                        # 3️⃣ التحقق مما إذا كان المستخدم مسبقاً في وضع التحويل البشري
-                        elif is_user_paused(sender_id):
-                            pass
+                        # 3️⃣ التحقق من الادعاء بالشخصية (أنا المدير / صاحب المركز)
+                        elif any(claim in user_text for claim in ["أنا المدير", "انا المدير", "صاحب المركز", "أنا صاحب المركز", "انا صاحب المركز", "إدارة المركز", "ادارة المركز"]) and not admin_info["is_admin"]:
+                            set_admin_status(sender_id, is_admin=0, awaiting_password=1)
+                            send_facebook_message(sender_id, "يرجى إدخال كلمة السر الخاصة بالإدارة لتأكيد الهوية:")
 
-                        # 4️⃣ التحقق من طلب التحويل لموظف بشري
-                        elif any(kw in user_text for kw in handover_keywords):
-                            set_handover_status(sender_id, status=1)
-                            send_facebook_message(sender_id, "تم تحويل طلبك لموظف المتابعة الإدارية وسيقوم أحد أعضاء الفريق بالرد عليكِ في أقرب وقت. (لتفعيل البوت مجدداً يمكنكِ إرسال: تشغيل البوت)")
+                        # 4️⃣ كلمة السر خاطئة أو انتظار إدخال كلمة السر
+                        elif admin_info["awaiting_password"] and user_text.strip() != "12341212":
+                            send_facebook_message(sender_id, "كلمة السر غير صحيحة. يرجى إدخال كلمة السر الخاصة بالإدارة لتأكيد الهوية:")
 
-                        # 5️⃣ معالجة الرسالة الطبيعية عبر البوت الذكي
                         else:
-                            ai_response = generate_ai_reply(sender_id, user_text)
-                            quick_replies = determine_quick_replies(ai_response)
-                            send_facebook_message(sender_id, ai_response, quick_replies)
+                            # كلمات التحويل لموظف وإعادة التفعيل
+                            handover_keywords = ["موظف", "بشري", "تواصل مباشر", "احكي مع حدا", "أحكي مع حدا", "تحدث مع انسان"]
+                            unpause_keywords = ["تشغيل البوت", "تفعيل البوت", "إعادة البوت", "اعادة البوت"]
+
+                            if any(kw in user_text for kw in unpause_keywords):
+                                set_handover_status(sender_id, status=0)
+                                send_facebook_message(sender_id, "تم تفعيل الرد التلقائي للبوت بنجاح! تفضلي كيف بقدر أساعدك؟")
+
+                            elif is_user_paused(sender_id) and not admin_info["is_admin"]:
+                                pass
+
+                            elif any(kw in user_text for kw in handover_keywords) and not admin_info["is_admin"]:
+                                set_handover_status(sender_id, status=1)
+                                send_facebook_message(sender_id, "تم تحويل طلبك لموظف المتابعة الإدارية وسيقوم أحد أعضاء الفريق بالرد عليكِ في أقرب وقت. (لتفعيل البوت مجدداً يمكنكِ إرسال: تشغيل البوت)")
+
+                            else:
+                                if admin_info["is_admin"]:
+                                    ai_response = generate_ai_reply(sender_id, f"[ملاحظة للنظام: المتحدث هو مدير الأكاديمية وصاحب المركز الموثق بكلمة السر 12341212] {user_text}")
+                                else:
+                                    ai_response = generate_ai_reply(sender_id, user_text)
+                                
+                                quick_replies = determine_quick_replies(ai_response)
+                                send_facebook_message(sender_id, ai_response, quick_replies)
 
     return "EVENT_RECEIVED", 200
 
