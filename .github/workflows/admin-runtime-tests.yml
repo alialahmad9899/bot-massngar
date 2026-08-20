@@ -1,0 +1,23 @@
+name: Admin Runtime Tests
+
+on:
+  push:
+    branches:
+      - main
+      - feature/admin-command-center-v2
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  admin-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test runner
+        run: python -m pip install --upgrade pytest
+      - name: Run structured admin/CRM tests
+        run: python -m pytest -q test_admin_command_center_v2.py
