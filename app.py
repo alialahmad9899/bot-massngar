@@ -1,8 +1,9 @@
 import hashlib
 import hmac
-import json 
+import json
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -493,6 +494,20 @@ def get_user_history_db(sender_id, limit=12):
     return history
 
 
+def get_user_message_count(sender_id):
+    """حساب عدد رسائل المستخدم المسجلة كـ user بدقة لضمان تحكم الجلسة ورسالة التعريف."""
+    with DB_LOCK:
+        conn = get_db_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM conversations WHERE sender_id=? AND role='user'",
+                (sender_id,),
+            ).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+
 def save_message_db(sender_id, role, content, intent=None, message_id=None):
     with DB_LOCK:
         conn = get_db_connection()
@@ -576,7 +591,6 @@ def get_admin_status(sender_id):
     return {"is_admin": False, "awaiting_password": False}
 
 
-
 # ========================================================
 # 👑 Admin Command Center
 # ========================================================
@@ -647,14 +661,12 @@ def _normalize_admin_text(text):
 
 
 def _extract_field(text, labels):
-    import re
     label = '|'.join(re.escape(x) for x in labels)
     match = re.search(rf'(?:{label})\s*[:=]?\s*([^,;\n]+)', text, re.IGNORECASE)
     return match.group(1).strip() if match else None
 
 
 def _extract_int_field(text, labels):
-    import re
     # Supports both: "السعر 900000" and "900000 ل.س" for price-like labels,
     # plus "16 درس" / "3 أيام" where the number precedes the label.
     label_pattern = '|'.join(re.escape(x) for x in labels)
@@ -668,8 +680,8 @@ def _extract_int_field(text, labels):
             return _money(match.group(1))
     return None
 
+
 def _extract_date(text):
-    import re
     match = re.search(r'(20\d{2}[-/]\d{1,2}[-/]\d{1,2})', text)
     if not match:
         return None
@@ -677,7 +689,6 @@ def _extract_date(text):
 
 
 def _extract_course_name(text):
-    import re
     patterns = [
         r'(?:دورة|course)\s+(.+?)(?=,|،|؛|;|:| السعر|السعر| عدد| العدد| الدفعة|الدفعة| تبدأ|تبدأ| تبدا|تبدا| المحاور|المحاور| 20\d{2}|$)',
     ]
@@ -936,7 +947,6 @@ def admin_execute(sender_id, command_text):
         # Natural-language generic academy setting updates, e.g.:
         # "غيّر رقم الواتساب إلى 099..." or "عدل عنوان المركز الى ..."
         if low.startswith('غير ') or low.startswith('غيّر ') or low.startswith('عدل ') or low.startswith('عدّل '):
-            import re
             m = re.match(r'(?:غير|غيّر|عدل|عدّل)\s+(.+?)\s+(?:الى|إلى)\s+(.+)$', raw, re.IGNORECASE)
             if m and 'دورة' not in m.group(1) and 'موعد' not in m.group(1):
                 key = m.group(1).strip(' :،,')
@@ -975,7 +985,6 @@ def admin_execute(sender_id, command_text):
             return {'ok': False, 'message': msg, 'code': 'CONFIRM_REQUIRED'}
 
         if 'أوقف الرد الآلي' in raw or 'اوقف الرد الالي' in low:
-            import re
             m = re.search(r'([0-9]{5,})', raw)
             if not m:
                 return {'ok': False, 'message': 'أرسل معرف المستخدم بعد الأمر.', 'code': 'BAD_FORMAT'}
@@ -986,7 +995,6 @@ def admin_execute(sender_id, command_text):
             return {'ok': True, 'message': msg}
 
         if 'فعّل الرد الآلي' in raw or 'فعل الرد الالي' in low:
-            import re
             m = re.search(r'([0-9]{5,})', raw)
             if not m:
                 return {'ok': False, 'message': 'أرسل معرف المستخدم بعد الأمر.', 'code': 'BAD_FORMAT'}
@@ -1083,7 +1091,6 @@ def admin_execute(sender_id, command_text):
 
         # Batch start date management.
         if 'أضف موعد بدء' in raw or 'اضف موعد بدء' in low:
-            import re
             m = re.search(r'(?:لدورة|للدورة)\s+(.+?)(?=\s*[:،,;]\s*20\d{2}|$)', raw)
             name = m.group(1).strip(' :،,;') if m else _extract_course_name(raw)
             start_date = _extract_date(raw)
@@ -1104,7 +1111,6 @@ def admin_execute(sender_id, command_text):
             return {'ok': True, 'message': msg}
 
         if 'عدل موعد بدء' in low or 'عدّل موعد بدء' in raw or 'تعديل موعد بدء' in low:
-            import re
             m = re.search(r'(?:لدورة|للدورة|دورة)\s+(.+?)(?=\s*(?:إلى|الى|:|،|,)\s*20\d{2}|$)', raw)
             name = m.group(1).strip(' :،,;') if m else _extract_course_name(raw)
             start_date = _extract_date(raw)
@@ -1201,16 +1207,17 @@ def build_dynamic_academy_knowledge():
     return '\n'.join(lines)
 
 
-# ========================================================
+# ==========================================================
 # 🧠 Prompt modularization
-# ========================================================
+# ==========================================================
 SYSTEM_POLICY = """
 أنت المساعد الذكي الرسمي لـ "الأكاديمية الدولية للتدريب المهني" في حمص.
 شخصيتك: طبيعي، مريح، مؤدب، لهجة سورية عامية راقية، نبرة مبيعات استشارية.
 ⛔ شرط أساسي وإلزامي: في أول رسالة لك مع المستخدم (بداية المحادثة)، يجب دائماً وبشكل صريح ومباشر أن تُعرّف عن نفسك بوضوح بأنك "المساعد الذكي التلقائي للأكاديمية" لكي يعلم الشخص تماماً أنه يتحدث مع نظام رد آلي بالذكاء الاصطناعي وليس مع موظف بشري.
 ⛔ ممنوع: الفواصل الجندرية (حابب/حابة)، العبارات الخشبية (دواعي سرورنا)، ومصطلحات الابتذال (لعيونك، يا غالي).
-⛔ المخاطبة: صيغة المؤنث هي الأساس لجميع استفسارات التجميل والمكياج والبشرة والأظافر والشنيون.
-⛔ صيغة المذكر فقط إذا كان الاستفسار عن الحلاقة الرجالية أو صرّح الشخص أنه شاب.
+⛔ المخاطبة الجندرية: صيغة المؤنث هي الأساس بشكل افتراضي لاستفسارات التجميل والمكياج والبشرة والأظافر والشنيون، إلا إذا صرّح المستخدم بأنه شاب/مذكر أو تبين ذلك فيُخاطَب بضمير المذكر حصراً دون أي افتراضات خاطئة.
+⛔ منع الافتراض التلقائي: إذا طلب شاب دورة تجميل/حلاقة نسائية/مكياج/بشرة، أجب عن تفاصيل الدورة التي طلبها بالكامل وبالمذكر، ولا تقترح عليه تحويله لحلاقة رجالية إلا إذا سأل هو بنفسه عنها.
+⛔ صيغة المذكر تستخدم إذا كان الاستفسار عن الحلاقة الرجالية أو صرّح الشخص أنه شاب.
 ⛔ إذا احتوى السياق على [مدير الأكاديمية]، تعامل معه باحترام كامل للمدير.
 """
 
@@ -1222,6 +1229,7 @@ SALES_RULES = """
 4. تثبيت عن بعد: اقترح الدفع عبر شام كاش للحجز عن بعد.
 5. ضمان الإتقان: أكد على ضمان الإتقان وإمكانية إعادة الدروس مجاناً مع القاعة التالية.
 6. المحاور: في نهاية كل محور يجب إضافة الملاحظة: "(ملاحظة: هذه رؤوس أقلام والمحور الشامل تفصيلي جداً، ولكن يتعذر إرساله بالكامل لأن الرسالة ستكون طويلة جداً)".
+7. ⛔ حفظ السياق والاختصاص: تتبّع دائماً الاختصاص أو الدورة التي ذكرها أو اختارها المستخدم في المحادثة السابقة، ولا تسأله مجدداً أسئلة عامة مثل (ما هي الدورة التي تبحث عنها) إذا كان قد حدد هدفه أو الدورة المطلوبة بالفعل.
 """
 
 ACADEMY_KNOWLEDGE = """
@@ -1419,9 +1427,21 @@ def generate_ai_reply(sender_id, user_message, intent=None, is_admin=False, mess
                 f"[نية محددة من النظام بناءً على زر: {intent}]\n"
                 f"{user_message}"
             )
-        
-        # إذا كانت هذه أول رسالة من المستخدم، يتم وسمها للذكاء الاصطناعي ليعرف عن نفسه فوراً
-        if len(conversation_history) <= 1 and not is_admin:
+
+        # 1. فحص الجنس وتحديد المذكر لو صرّح بكونه شاب/رجل لتفادي الافتراض الخاطئ
+        male_patterns = [
+            r"\bأنا\s+شب\b", r"\bانا\s+شب\b", r"\bأنا\s+شاب\b", r"\bانا\s+شاب\b",
+            r"\bأنا\s+رجل\b", r"\bانا\s+رجل\b", r"\bشب\b", r"\bشاب\b"
+        ]
+        if any(re.search(pat, user_message, re.IGNORECASE) for pat in male_patterns):
+            current_text = (
+                "[تنبيه نظام حاسم: المستخدم صرّح بأنه شاب/مذكر. التزم بضمائر المذكر حصراً عند مخاطبته، ولا تفترض أو تجبره على تغيير الدورة التي يطلبها حتى لو كانت حلاقة نسائية أو مكياج أو بشرة]\n"
+                + current_text
+            )
+
+        # 2. الاعتماد على الاستعلام الدقيق لقاعدة البيانات لمنع تكرار رسالة التعريف بنفسه في منتصف المحادثة
+        user_msg_count = get_user_message_count(sender_id)
+        if user_msg_count == 1 and not is_admin:
             current_text = (
                 "[تنبيه نظام: هذه أول رسالة للمستخدِم في المحادثة. يُرجى البدء فوراً بالتعريف عن نفسك بوضوح كـ (المساعد الذكي التلقائي للأكاديمية) لكي يعلم تماماً أنه يتحدث مع نظام ذكاء اصطناعي وليس موظفاً بشرياً]\n"
                 + current_text
@@ -1718,11 +1738,20 @@ def handle_messages():
 
     for entry in data.get("entry", []):
         for messaging_event in entry.get("messaging", []):
-            if messaging_event.get("message") and not messaging_event["message"].get("is_echo"):
+            msg = messaging_event.get("message")
+            if msg:
+                # 3. معالجة تداخل الموظف البشري: إيقاف البوت فوراً عند صدور أي رسالة من الصفحة (is_echo)
+                if msg.get("is_echo"):
+                    customer_id = messaging_event.get("recipient", {}).get("id")
+                    if customer_id:
+                        set_handover_status(customer_id, status=1)
+                        print(f"[HANDOVER] Auto-paused bot for customer={customer_id} due to staff echo message.", flush=True)
+                    continue
+
                 sender_id = messaging_event.get("sender", {}).get("id")
                 if not sender_id:
                     continue
-                message_id = messaging_event.get("message", {}).get("mid")
+                message_id = msg.get("mid")
                 if message_id and is_duplicate_message(message_id):
                     print(f"[WEBHOOK] duplicate mid={message_id}", flush=True)
                     continue
