@@ -71,6 +71,10 @@ ADMIN_ATTEMPTS_LOCK = threading.Lock()
 LAST_PROCESSED_TIME = {}
 LAST_PROCESSED_LOCK = threading.Lock()
 
+# Tacking bot's own sent messages to accurately distinguish staff echoes from bot echoes.
+BOT_SENT_MIDS = {}  # {message_id: timestamp}
+BOT_SENT_LOCK = threading.Lock()
+
 # Stripe locks avoid an unbounded dict of per-user Lock objects.
 USER_LOCK_COUNT = 32
 USER_LOCKS = [threading.Lock() for _ in range(USER_LOCK_COUNT)]
@@ -145,8 +149,7 @@ def init_db():
                 """
             )
 
-            # Durable local inbox. Render restarts still require a persistent disk
-            # for these rows to survive process/instance replacement.
+            # Durable local inbox.
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS webhook_events (
@@ -174,8 +177,7 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_conversations_sender_id ON conversations(sender_id, id)"
             )
 
-            # Admin-managed knowledge and operational tables. These let the verified
-            # manager change academy data without editing Python code.
+            # Admin-managed knowledge and operational tables.
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS academy_courses (
@@ -241,7 +243,77 @@ def init_db():
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_course_batches_course ON course_batches(course_id, start_date)"
             )
+
+            # Table for synced Facebook Page posts
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS page_posts (
+                    post_id TEXT PRIMARY KEY,
+                    message TEXT,
+                    created_time TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             conn.commit()
+        finally:
+            conn.close()
+
+
+def sync_facebook_page_posts(limit=10):
+    """جلب وتحديث منشورات الصفحة من Graph API وتخزينها في قاعدة البيانات المحلية"""
+    url = "https://graph.facebook.com/v19.0/me/feed"
+    params = {
+        "access_token": PAGE_ACCESS_TOKEN,
+        "fields": "id,message,created_time",
+        "limit": limit,
+    }
+    try:
+        response = FACEBOOK_SESSION.get(url, params=params, timeout=FACEBOOK_TIMEOUT_SECONDS)
+        if response.status_code == 200:
+            posts_data = response.json().get("data", [])
+            count = 0
+            with DB_LOCK:
+                conn = get_db_connection()
+                try:
+                    for post in posts_data:
+                        post_id = post.get("id")
+                        msg = post.get("message")
+                        ctime = post.get("created_time")
+                        if post_id and msg:
+                            conn.execute(
+                                """
+                                INSERT INTO page_posts (post_id, message, created_time)
+                                VALUES (?, ?, ?)
+                                ON CONFLICT(post_id) DO UPDATE SET
+                                    message=excluded.message,
+                                    created_time=excluded.created_time,
+                                    updated_at=CURRENT_TIMESTAMP
+                                """,
+                                (post_id, msg, ctime),
+                            )
+                            count += 1
+                    conn.commit()
+                finally:
+                    conn.close()
+            print(f"[PAGE_SYNC] Successfully synced {count} posts from Facebook Page.", flush=True)
+            return True, count
+        else:
+            print(f"[PAGE_SYNC] Failed with status {response.status_code}: {response.text}", flush=True)
+            return False, 0
+    except Exception as exc:
+        print(f"[PAGE_SYNC] Exception during feed sync: {exc}", flush=True)
+        return False, 0
+
+
+def _get_recent_page_posts(limit=6):
+    with DB_LOCK:
+        conn = get_db_connection()
+        try:
+            return conn.execute(
+                "SELECT message, created_time FROM page_posts WHERE message IS NOT NULL AND message <> '' ORDER BY created_time DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         finally:
             conn.close()
 
@@ -265,7 +337,7 @@ def reset_stale_processing_events():
 
 
 def enqueue_webhook_event(sender_id: str, message_id: Optional[str], payload: dict) -> Optional[int]:
-    """Persist first, enqueue second. This prevents loss when RAM queue is full."""
+    """Persist first, enqueue second."""
     raw_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with DB_LOCK:
         conn = get_db_connection()
@@ -297,7 +369,6 @@ def enqueue_webhook_event(sender_id: str, message_id: Optional[str], payload: di
             MESSAGE_QUEUE.put_nowait(event_id)
             print(f"[QUEUE] enqueued event_id={event_id} size={MESSAGE_QUEUE.qsize()}", flush=True)
         except queue.Full:
-            # Revert to pending so the DB-backed poller can pick it up later.
             with DB_LOCK:
                 conn = get_db_connection()
                 try:
@@ -374,7 +445,6 @@ def load_event(event_id: int):
 
 
 def claim_queued_or_pending_event(event_id: int) -> bool:
-    """Atomically claim an event already queued in RAM or left pending in DB."""
     with DB_LOCK:
         conn = get_db_connection()
         try:
@@ -495,7 +565,6 @@ def get_user_history_db(sender_id, limit=12):
 
 
 def get_user_message_count(sender_id):
-    """حساب عدد رسائل المستخدم المسجلة كـ user بدقة لضمان تحكم الجلسة ورسالة التعريف."""
     with DB_LOCK:
         conn = get_db_connection()
         try:
@@ -667,8 +736,6 @@ def _extract_field(text, labels):
 
 
 def _extract_int_field(text, labels):
-    # Supports both: "السعر 900000" and "900000 ل.س" for price-like labels,
-    # plus "16 درس" / "3 أيام" where the number precedes the label.
     label_pattern = '|'.join(re.escape(x) for x in labels)
     patterns = [
         rf'(?:{label_pattern})\s*[:=]?\s*([0-9][0-9,]*)',
@@ -766,8 +833,6 @@ def _all_dynamic_knowledge():
 
 
 def _seed_legacy_courses_if_empty():
-    # Seed the original hard-coded catalogue exactly once for existing deployments.
-    # After the manager edits/deletes courses, we never resurrect the old catalogue.
     with DB_LOCK:
         conn = get_db_connection()
         try:
@@ -849,12 +914,11 @@ def _set_course(conn, name, fields):
 
 
 def admin_execute(sender_id, command_text):
-    """Deterministic, audited admin command router. Returns {ok, message, code?}."""
+    """Deterministic, audited admin command router."""
     raw = (command_text or '').strip()
     text = _normalize_admin_text(raw)
     low = text.lower()
 
-    # Confirmation of a destructive/sensitive action.
     if low in {'نعم', 'اكد', 'اكد التنفيذ', 'تأكيد', 'تاكيد', 'موافق'}:
         return confirm_admin_action(sender_id)
     if low in {'لا', 'الغاء', 'إلغاء', 'cancel'}:
@@ -867,6 +931,7 @@ def admin_execute(sender_id, command_text):
         if any(k in low for k in ['مساعده المدير', 'اوامر المدير', 'اوامر الاداره', 'شو فيني اعدل', 'ماذا تستطيع ان تنفذ']):
             msg = (
                 'أوامر الإدارة المتاحة حالياً:\n'
+                '• مزامنة المنشورات / تحديث الصفحة (لجلب أحدث المنشورات)\n'
                 '• أضف دورة ...\n'
                 '• عدّل دورة ...\n'
                 '• عطّل/فعّل دورة ...\n'
@@ -887,6 +952,12 @@ def admin_execute(sender_id, command_text):
             _admin_audit(sender_id, 'help', raw, msg)
             return {'ok': True, 'message': msg}
 
+        if 'مزامنة المنشورات' in low or 'تحديث المنشورات' in low or 'تحديث الصفحة' in low:
+            ok, count = sync_facebook_page_posts(limit=10)
+            msg = f"تمت مزامنة منشورات الصفحة بنجاح! تم حفظ {count} منشور جديد/محدث. 📲" if ok else "حدث خطأ أثناء مزامنة منشورات الصفحة."
+            _admin_audit(sender_id, 'sync_posts', raw, msg)
+            return {'ok': ok, 'message': msg}
+
         if 'احصائيات' in low or 'احصائيات البوت' in low:
             with DB_LOCK:
                 conn = get_db_connection()
@@ -895,9 +966,10 @@ def admin_execute(sender_id, command_text):
                     users = conn.execute('SELECT COUNT(DISTINCT sender_id) FROM conversations').fetchone()[0]
                     paused = conn.execute('SELECT COUNT(*) FROM human_handover WHERE is_paused=1').fetchone()[0]
                     events = conn.execute("SELECT COUNT(*) FROM webhook_events WHERE status IN ('queued','pending','processing')").fetchone()[0]
+                    posts_count = conn.execute("SELECT COUNT(*) FROM page_posts").fetchone()[0]
                 finally:
                     conn.close()
-            msg = f'إحصائيات البوت:\nالرسائل: {total_messages}\nالمستخدمين: {users}\nالمحادثات المحولة لموظف: {paused}\nالأحداث قيد المعالجة: {events}'
+            msg = f'إحصائيات البوت:\nالرسائل: {total_messages}\nالمستخدمين: {users}\nالمحادثات المحولة لموظف: {paused}\nالأحداث قيد المعالجة: {events}\nمنشورات الصفحة المخزنة: {posts_count}'
             _admin_audit(sender_id, 'stats', raw, msg)
             return {'ok': True, 'message': msg}
 
@@ -944,8 +1016,6 @@ def admin_execute(sender_id, command_text):
             _admin_audit(sender_id, 'set_info', raw, msg)
             return {'ok': True, 'message': msg}
 
-        # Natural-language generic academy setting updates, e.g.:
-        # "غيّر رقم الواتساب إلى 099..." or "عدل عنوان المركز الى ..."
         if low.startswith('غير ') or low.startswith('غيّر ') or low.startswith('عدل ') or low.startswith('عدّل '):
             m = re.match(r'(?:غير|غيّر|عدل|عدّل)\s+(.+?)\s+(?:الى|إلى)\s+(.+)$', raw, re.IGNORECASE)
             if m and 'دورة' not in m.group(1) and 'موعد' not in m.group(1):
@@ -1175,11 +1245,10 @@ def confirm_admin_action(sender_id):
 
 
 def clear_admin_store_for_tests():
-    """Test helper: clears only manager-managed data, never user conversations."""
     with DB_LOCK:
         conn = get_db_connection()
         try:
-            for table in ['course_batches','academy_courses','academy_info','admin_audit_log','admin_pending_actions']:
+            for table in ['course_batches','academy_courses','academy_info','admin_audit_log','admin_pending_actions','page_posts']:
                 conn.execute(f'DELETE FROM {table}')
             conn.commit()
         finally:
@@ -1191,6 +1260,8 @@ def build_dynamic_academy_knowledge():
     courses = admin_list_courses()
     batches = admin_list_batches()
     info = _all_dynamic_knowledge()
+    posts = _get_recent_page_posts(limit=6)
+
     lines = ['\n\n=== البيانات الحالية التي يديرها المدير ===']
     for c in courses:
         lines.append(
@@ -1204,6 +1275,13 @@ def build_dynamic_academy_knowledge():
         lines.append('معلومات إضافية:')
         for k, v in info:
             lines.append(f'- {k}: {v}')
+
+    if posts:
+        lines.append('\n=== أحدث المنشورات والإعلانات الرسمية من صفحة الفيسبوك ===')
+        for msg, ctime in posts:
+            date_str = ctime[:10] if ctime else 'غير محدد'
+            lines.append(f"• [تاريخ المنشور: {date_str}]: {msg.strip()}")
+
     return '\n'.join(lines)
 
 
@@ -1223,18 +1301,22 @@ SYSTEM_POLICY = """
 """
 
 SALES_RULES = """
-⛔ قواعد الإقناع وتدفق المحادثة والتفاعل:
+⛔ قواعد الإقناع وتدفق المحادثة والتحليل الذكي للمعلومات:
 1. الإيجاز والاختصار (ياخد ويعطي): تجنب إرسال الرسائل الطويلة جداً أو المكدسة بالمعلومات. اجعل ردودك قصيرة وتفاعلية، مقسمة بأسئلة لطيفة لاستمرار المحادثة.
-2. أسلوب التفاعل مع استفسارات الدورات:
+2. تحليل التعارض وتحديث البيانات من منشورات الصفحة:
+   - تم تزويدك بقسم "أحدث المنشورات والإعلانات الرسمية من صفحة الفيسبوك".
+   - إذا وجِدت معلومة (سعر جديد، حسم خاص، بداية دورة، تفاصيل مسابقة) مذكورة في المنشورات وهي أحدث تاريخاً من المعلومات أو الجدول القديم، اعتمد المنشور الأحدث دائماً لضمان عدم التعارض.
+   - إذا سأل الزبون عن تفاصيل أو استفسار ناقص في الجدول الثابت ولكنه مذكور في منشورات الصفحة، استخرج الجواب من المنشور وأجبه بدقة ولطافة.
+3. أسلوب التفاعل مع استفسارات الدورات:
    - حالة ذكر اسم الدورة فقط (مثلاً أرسل: "ميك أب"): إذا لم يسبق للزبون طرح سؤال عن السعر أو المحاور في ذات المحادثة، لا تعطه كل المعلومات دفعة واحدة، بل رحّب به وخذ وأعطِ معه بأسلوب لطيف، مثل: "أهلاً بكِ! 🌸 حابة تعرفي تفاصيل المحاور والدروس ولا الأسعار والأقساط؟".
    - حالة السؤال عن السعر مباشرة (مثلاً: "سعر ميك أب") أو حالة سؤال الزبون عن "السعر" سابقاً ثم كتابة اسم الدورة الآن ("ميك أب"): اربط التفاصيل فوراً وأعطه سعر الدورة الجماعية والدفعة الأولى دون تردد، ثم أتبع ردك بسؤال أنيق واستشاري (مثلاً: "حابة أعرض عليكِ تفاصيل أوقات الدوام أو كيفية التثبيت؟ 😊").
-3. بناء القيمة: قبل أو أثناء عرض السعر، وضح القيمة بإيجاز (تدريب عملي، مواد مؤمنة، شهادة رسمية).
-4. توضيح الأقساط: السعر يقسم لدفعة أولى للتثبيت والباقي دفعات مرنة.
-5. تثبيت عن بعد: اقترح الدفع عبر شام كاش للحجز عن بعد عند المناسبة 💳.
-6. ضمان الإتقان: أكد على ضمان الإتقان وإمكانية إعادة الدروس مجاناً مع القاعة التالية عند الحاجة.
-7. المحاور: في نهاية كل محور يجب إضافة الملاحظة: "(ملاحظة: هذه رؤوس أقلام والمحور الشامل تفصيلي جداً، ولكن يتعذر إرساله بالكامل لأن الرسالة ستكون طويلة جداً)".
-8. ⛔ حفظ السياق والاختصاص: تتبّع دائماً الأسئلة والتفاصيل المذكورة في المحادثة السابقة، ولا تسأله مجدداً أسئلة عامة إذا كان قد حدد هدفه أو سأل عنها سابقاً.
-9. 🌟 الترويج الذكي والديناميكي للدورات الخاصة (Private):
+4. بناء القيمة: قبل أو أثناء عرض السعر، وضح القيمة بإيجاز (تدريب عملي، مواد مؤمنة، شهادة رسمية).
+5. توضيح الأقساط: السعر يقسم لدفعة أولى للتثبيت والباقي دفعات مرنة.
+6. تثبيت عن بعد: اقترح الدفع عبر شام كاش للحجز عن بعد عند المناسبة 💳.
+7. ضمان الإتقان: أكد على ضمان الإتقان وإمكانية إعادة الدروس مجاناً مع القاعة التالية عند الحاجة.
+8. المحاور: في نهاية كل محور يجب إضافة الملاحظة: "(ملاحظة: هذه رؤوس أقلام والمحور الشامل تفصيلي جداً، ولكن يتعذر إرساله بالكامل لأن الرسالة ستكون طويلة جداً)".
+9. ⛔ حفظ السياق والاختصاص: تتبّع دائماً الأسئلة والتفاصيل المذكورة في المحادثة السابقة، ولا تسأله مجدداً أسئلة عامة إذا كان قد حدد هدفه أو سأل عنها سابقاً.
+10. 🌟 الترويج الذكي والديناميكي للدورات الخاصة (Private):
    - تنبيه هويّة الأسعار: الأسعار والبدايات الموجودة في النظام والقائمة هي الخاصة بـ "الدورات الجماعية" (ضمن مجموعات).
    - الترويج المعتدل والذكي: يُتاح للأكاديمية أيضاً إمكانية إعطاء "دورات خاصة / فردية (Private)". روّج لهذه الفكرة بنبرة استشارية راقية فقط عندما يكون الوقت والموقف مناسبين في المحادثة (مثلاً: إذا أبدى الزبون اهتماماً بمواعيد مرنة جداً، أو رغبة بتعلم مكثف وشخصي، أو استفسر عن إمكانية التدريب الفردي). ⛔ يُمنع تكرار هذا العرض في كل رسالة أو فرضها بشكل ملح ومزعج.
    - التعامل مع سعر الدورة الخاصة: إذا سأل الزبون عن سعر أو تفاصيل الدورة الخاصة (Private)، وضح له بلباقة أن الدورة الخاصة تُفصّل خصيصاً بحسب احتياجه الشامل وعدد الدروس والجدول والوقت المفضل لديه، ولذلك تختلف التكلفة، ثم وجّهه لتنسيق ذلك مباشرة مع "مدير المركز / الإدارة" للاطلاع على تفاصيل السعر الخاص به.
@@ -1249,7 +1331,7 @@ ACADEMY_KNOWLEDGE = """
 تفاصيل الشهادات: الشهادة والتصديقات الرسمية مشمولة بسعر الدورة ولا توجد تكاليف إضافية ✨.
 طبيعة الدورات والأسعار: الأسعار الموضحة بالجدول هي للدورات الجماعية. تتوفر كذلك دورات خاصة فردية (Private) يتحدد سعرها وجدولها بالتنسيق المباشر مع إدارة المركز ومدير الأكاديمية بحسب عدد الدروس والاحتياج التدريبي.
 
-مهم جداً: بيانات الدورات والمواعيد والمعلومات الإضافية التي تُضاف إلى النظام يتم إدراجها بعد هذه التعليمات في قسم "البيانات الحالية التي يديرها المدير"، وهي المصدر الأحدث والواجب اعتماده عند التعارض مع أي بيانات ثابتة.
+مهم جداً: بيانات الدورات والمواعيد والمعلومات الإضافية أو منشورات الصفحة التي تُضاف إلى النظام يتم إدراجها بعد هذه التعليمات، وهي المصدر الأحدث والواجب اعتماده عند التعارض مع أي بيانات ثابتة قديمة.
 """
 
 SYSTEM_INSTRUCTION = f"{SYSTEM_POLICY}\n\n{SALES_RULES}\n\n{ACADEMY_KNOWLEDGE}"
@@ -1342,7 +1424,6 @@ def wait_for_user_rate_limit(sender_id):
         last = LAST_PROCESSED_TIME.get(sender_id, 0.0)
         wait = max(0.0, USER_RATE_LIMIT_SECONDS - (now - last))
         if wait:
-            # Marking happens after the wait, outside the lock, to avoid blocking others.
             pass
     if wait:
         time.sleep(wait)
@@ -1409,7 +1490,16 @@ def send_facebook_message(recipient_id, message_text, quick_replies=None):
     if quick_replies:
         message["quick_replies"] = quick_replies
     try:
-        facebook_post({"recipient": {"id": recipient_id}, "message": message})
+        response = facebook_post({"recipient": {"id": recipient_id}, "message": message})
+        if response and response.status_code == 200:
+            try:
+                res_json = response.json()
+                sent_mid = res_json.get("message_id")
+                if sent_mid:
+                    with BOT_SENT_LOCK:
+                        BOT_SENT_MIDS[sent_mid] = time.time()
+            except Exception:
+                pass
         return True
     except Exception as exc:
         print(f"Failed to send FB message: {exc}")
@@ -1448,7 +1538,7 @@ def generate_ai_reply(sender_id, user_message, intent=None, is_admin=False, mess
                 + current_text
             )
 
-        # 2. الاعتماد على الاستعلام الدقيق لقاعدة البيانات لمنع تكرار رسالة التعريف بنفسه في منتصف المحادثة
+        # 2. منع تكرار رسالة التعريف
         user_msg_count = get_user_message_count(sender_id)
         if user_msg_count == 1 and not is_admin:
             current_text = (
@@ -1461,7 +1551,6 @@ def generate_ai_reply(sender_id, user_message, intent=None, is_admin=False, mess
                 "[مدير الأكاديمية]\n" + current_text
             )
 
-        # Keep the current message as the last user turn while retaining the existing history.
         contents = conversation_history[:-1] if conversation_history else []
         contents.append({"role": "user", "parts": [{"text": current_text}]})
 
@@ -1530,16 +1619,16 @@ def process_single_message(event_payload, event_id=None):
     if not user_text and not intent:
         return
 
-    # Deduplication is performed at Webhook ingestion. Retries from the durable inbox
-    # must be allowed to reach Facebook again after transient delivery failures.
-
-    # Per-user serialization keeps conversational history ordered.
     with get_user_lock(sender_id):
         wait_for_user_rate_limit(sender_id)
-        send_typing_indicator(sender_id)
         admin_info = get_admin_status(sender_id)
 
-        # Admin password flow must be completed after explicit admin claim.
+        if is_user_paused(sender_id) and not admin_info["is_admin"]:
+            print(f"[HANDOVER] Skipping bot response for paused user={sender_id}", flush=True)
+            return
+
+        send_typing_indicator(sender_id)
+
         if admin_info["awaiting_password"]:
             is_locked, time_left = check_admin_lockout(sender_id)
             if is_locked:
@@ -1568,7 +1657,6 @@ def process_single_message(event_payload, event_id=None):
                     raise RuntimeError("Failed to deliver admin failure message")
             return
 
-        # Explicit admin claim -> ask for password, do not grant privileges.
         if any(
             claim in user_text
             for claim in ["أنا المدير", "انا المدير", "صاحب المركز", "إدارة المركز", "ادارة المركز"]
@@ -1578,8 +1666,6 @@ def process_single_message(event_payload, event_id=None):
                 raise RuntimeError("Failed to deliver admin prompt")
             return
 
-        # Verified manager commands are deterministic and audited. Gemini is only used
-        # for natural-language understanding when no concrete admin tool matches.
         if admin_info["is_admin"]:
             admin_result = admin_execute(sender_id, user_text)
             if admin_result.get("code") != "NOT_ADMIN_COMMAND":
@@ -1588,7 +1674,6 @@ def process_single_message(event_payload, event_id=None):
                     raise RuntimeError("Failed to deliver admin command response")
                 return
 
-        # Human handover controls are deterministic and do not consume Gemini.
         handover_keywords = ["موظف", "بشري", "تواصل مباشر", "احكي مع حدا", "أحكي مع حدا", "تحدث مع انسان"]
         unpause_keywords = ["تشغيل البوت", "تفعيل البوت", "إعادة البوت", "اعادة البوت"]
 
@@ -1596,9 +1681,6 @@ def process_single_message(event_payload, event_id=None):
             set_handover_status(sender_id, status=0)
             if not send_facebook_message(sender_id, "تم تفعيل الرد التلقائي للبوت بنجاح! تفضلي كيف بقدر أساعدك؟ 😊"):
                 raise RuntimeError("Failed to deliver unpause message")
-            return
-
-        if is_user_paused(sender_id) and not admin_info["is_admin"]:
             return
 
         if any(kw in user_text for kw in handover_keywords) and not admin_info["is_admin"]:
@@ -1625,7 +1707,7 @@ def process_single_message(event_payload, event_id=None):
 
 
 # ========================================================
-# 🔄 Worker pool: bounded RAM, DB-backed pending events
+# 🔄 Worker pool
 # ========================================================
 def process_event_record(event_id: int):
     print(f"[EVENT] loading event_id={event_id}", flush=True)
@@ -1653,7 +1735,6 @@ def process_event_record(event_id: int):
 
 
 def worker_iteration(timeout=0.5):
-    """Process at most one event. RAM-queued events are claimed once; DB-recovered events are already claimed."""
     event_id = None
     from_queue = False
     try:
@@ -1661,19 +1742,15 @@ def worker_iteration(timeout=0.5):
             event_id = MESSAGE_QUEUE.get(timeout=timeout)
             from_queue = True
         except queue.Empty:
-            # This function atomically changes pending/queued -> processing.
             event_id = claim_next_pending_event()
 
         if event_id is None:
             return None
 
         if from_queue:
-            # A freshly enqueued event is still queued in SQLite. This is the one and only
-            # claim for the RAM-queue path. Do not claim a second time.
             if not claim_queued_or_pending_event(event_id):
                 print(f"[WORKER] event_id={event_id} was already claimed; skipping", flush=True)
                 return None
-        # For the DB-recovery path, claim_next_pending_event() already set processing.
 
         print(f"[WORKER] claimed event_id={event_id} source={'ram' if from_queue else 'db'}", flush=True)
         process_event_record(event_id)
@@ -1737,7 +1814,6 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def handle_messages():
-    # Signature verification is mandatory in production.
     if not verify_facebook_signature(request):
         return "Invalid Signature", 403
 
@@ -1746,12 +1822,33 @@ def handle_messages():
         return "EVENT_RECEIVED", 200
 
     for entry in data.get("entry", []):
+        # 1. إذا وجد حدث منشور جديد على الصفحة (feed event)، قم بجدولة المزامنة
+        changes = entry.get("changes", [])
+        for change in changes:
+            if change.get("field") == "feed":
+                threading.Thread(target=sync_facebook_page_posts, args=(10,), daemon=True).start()
+
         for messaging_event in entry.get("messaging", []):
             msg = messaging_event.get("message")
             if msg:
-                # 3. معالجة تداخل الموظف البشري: إيقاف البوت فوراً عند صدور أي رسالة من الصفحة (is_echo)
                 if msg.get("is_echo"):
                     customer_id = messaging_event.get("recipient", {}).get("id")
+                    mid = msg.get("mid")
+
+                    is_bot_own_message = False
+                    if mid:
+                        with BOT_SENT_LOCK:
+                            now = time.time()
+                            expired = [m for m, t in BOT_SENT_MIDS.items() if now - t > 600]
+                            for m in expired:
+                                del BOT_SENT_MIDS[m]
+                            if mid in BOT_SENT_MIDS:
+                                is_bot_own_message = True
+                                del BOT_SENT_MIDS[mid]
+
+                    if is_bot_own_message:
+                        continue
+
                     if customer_id:
                         set_handover_status(customer_id, status=1)
                         print(f"[HANDOVER] Auto-paused bot for customer={customer_id} due to staff echo message.", flush=True)
@@ -1775,6 +1872,13 @@ def handle_messages():
 # ========================================================
 init_db()
 _seed_legacy_courses_if_empty()
+
+# جلب منشورات الصفحة فور تشغيل البوت
+try:
+    threading.Thread(target=sync_facebook_page_posts, args=(10,), daemon=True).start()
+except Exception as e:
+    print(f"Failed to trigger initial page post sync: {e}")
+
 if AUTO_START_WORKERS:
     start_workers()
 else:
