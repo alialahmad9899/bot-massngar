@@ -2,17 +2,15 @@
 from __future__ import annotations
 
 import re
-import time
 
 import admin_runtime as base
 
 
 def _normalize(text: str) -> str:
     value = (text or '').strip()
-    # Arabic tashkeel/harakat, including shadda in forms such as غيّر/عدّل.
+    # Remove Arabic tashkeel/harakat, including shadda in غيّر/عدّل, while preserving letters such as أ in course names.
     value = re.sub(r'[\u0610-\u061A\u064B-\u065F\u0670]', '', value)
-    for a, b in {'أ': 'ا', 'إ': 'ا', 'آ': 'ا', '،': ',', '؛': ';'}.items():
-        value = value.replace(a, b)
+    value = value.replace('،', ',').replace('؛', ';')
     return re.sub(r'\s+', ' ', value)
 
 
