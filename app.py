@@ -1822,6 +1822,8 @@ def handle_messages():
         return "EVENT_RECEIVED", 200
 
     for entry in data.get("entry", []):
+        page_id = entry.get("id")
+
         # 1. إذا وجد حدث منشور جديد على الصفحة (feed event)، قم بجدولة المزامنة
         changes = entry.get("changes", [])
         for change in changes:
@@ -1830,39 +1832,44 @@ def handle_messages():
 
         for messaging_event in entry.get("messaging", []):
             msg = messaging_event.get("message")
-            if msg:
-                if msg.get("is_echo"):
-                    customer_id = messaging_event.get("recipient", {}).get("id")
-                    mid = msg.get("mid")
+            sender_id = messaging_event.get("sender", {}).get("id")
+            recipient_id = messaging_event.get("recipient", {}).get("id")
 
-                    is_bot_own_message = False
-                    if mid:
-                        with BOT_SENT_LOCK:
-                            now = time.time()
-                            expired = [m for m, t in BOT_SENT_MIDS.items() if now - t > 600]
-                            for m in expired:
-                                del BOT_SENT_MIDS[m]
-                            if mid in BOT_SENT_MIDS:
-                                is_bot_own_message = True
-                                del BOT_SENT_MIDS[mid]
+            # التقاط رسائل الموظف: سواء حملت علم is_echo أو كان sender_id هو معرف الصفحة نفسها
+            is_echo_msg = bool(msg and msg.get("is_echo"))
+            is_page_sender = bool(page_id and sender_id == page_id)
 
-                    if is_bot_own_message:
-                        continue
+            if is_echo_msg or is_page_sender:
+                customer_id = recipient_id
+                mid = msg.get("mid") if msg else None
 
-                    if customer_id:
-                        set_handover_status(customer_id, status=1)
-                        print(f"[HANDOVER] Auto-paused bot for customer={customer_id} due to staff echo message.", flush=True)
+                is_bot_own_message = False
+                if mid:
+                    with BOT_SENT_LOCK:
+                        now = time.time()
+                        expired = [m for m, t in BOT_SENT_MIDS.items() if now - t > 600]
+                        for m in expired:
+                            del BOT_SENT_MIDS[m]
+                        if mid in BOT_SENT_MIDS:
+                            is_bot_own_message = True
+                            del BOT_SENT_MIDS[mid]
+
+                if is_bot_own_message:
                     continue
 
-                sender_id = messaging_event.get("sender", {}).get("id")
-                if not sender_id:
-                    continue
-                message_id = msg.get("mid")
-                if message_id and is_duplicate_message(message_id):
-                    print(f"[WEBHOOK] duplicate mid={message_id}", flush=True)
-                    continue
-                print(f"[WEBHOOK] received sender={sender_id} mid={message_id}", flush=True)
-                enqueue_webhook_event(sender_id, message_id, messaging_event)
+                if customer_id:
+                    set_handover_status(customer_id, status=1)
+                    print(f"[HANDOVER] Auto-paused bot for customer={customer_id} due to staff message/echo.", flush=True)
+                continue
+
+            if not sender_id:
+                continue
+            message_id = msg.get("mid") if msg else None
+            if message_id and is_duplicate_message(message_id):
+                print(f"[WEBHOOK] duplicate mid={message_id}", flush=True)
+                continue
+            print(f"[WEBHOOK] received sender={sender_id} mid={message_id}", flush=True)
+            enqueue_webhook_event(sender_id, message_id, messaging_event)
 
     return "EVENT_RECEIVED", 200
 
