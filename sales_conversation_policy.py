@@ -31,18 +31,8 @@ PAYMENT_QUESTION_PATTERNS = (
 )
 
 BANNED_AFFECTION_TERMS = (
-    "حبيبي",
-    "حبيبتي",
-    "غاليتي",
-    "غالية",
-    "غالي",
-    "يا غالي",
-    "يا غالية",
-    "يا حبيب",
-    "يا حبيبتي",
-    "عيوني",
-    "لعيونك",
-    "تؤبريني",
+    "حبيبي", "حبيبتي", "غاليتي", "غالية", "غالي", "يا غالي", "يا غالية",
+    "يا حبيب", "يا حبيبتي", "عيوني", "لعيونك", "تؤبريني",
 )
 
 REPLACEMENTS = {
@@ -59,6 +49,12 @@ REPLACEMENTS = {
     "لعيونك": "بكل سرور",
     "تؤبريني": "أهلاً بكِ",
 }
+
+PAYMENT_CTA_TERMS = (
+    "شام كاش", "شامكاش", "ثبتّي", "ثبتي", "ثبتلي", "تثبيت", "تثبيت الاسم",
+    "تثبيت المقعد", "تسجيل الاسم", "احجز", "حجز", "سجل", "تسجيل", "الدفعة الأولى",
+    "الدفعة الاولى", "الدفع عن بعد", "ثبت مقعد",
+)
 
 
 def _normalize(text: str) -> str:
@@ -89,6 +85,24 @@ def sanitize_professional_response(text: str) -> str:
     for banned, replacement in REPLACEMENTS.items():
         value = value.replace(banned, replacement)
     return value
+
+
+def guard_response(user_message: str, response_text: str) -> str:
+    """Enforce no-premature-booking rule after Gemini generation as a deterministic safety net."""
+    value = sanitize_professional_response(response_text)
+    if should_offer_payment(user_message):
+        return value
+
+    # Remove complete sentences that introduce booking/payment without user commitment.
+    parts = re.split(r"(?<=[.!؟\n])\s+", value)
+    kept = []
+    for part in parts:
+        normalized = _normalize(part)
+        if any(term in normalized for term in PAYMENT_CTA_TERMS):
+            continue
+        kept.append(part)
+    cleaned = " ".join(p.strip() for p in kept if p.strip()).strip()
+    return cleaned or "تفضلي، اذكري لي المعلومة التي تودين معرفتها وسأوضحها لكِ بشكل مباشر."
 
 
 SALES_POLICY = r"""
