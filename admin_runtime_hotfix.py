@@ -28,10 +28,10 @@ def _parse_structured_update(text: str):
         return None
     args = {'name': match.group(1).strip(' .،,')}
     patterns = {
-        'price': r'(?:السعر|سعر)(?:\s+دورة\s+[^,;]+?)?\s*(?:إلى|الى|=|:)??\s*([0-9][0-9,]*)',
-        'first_payment': r'(?:الدفعة الأولى|الدفعة الاولى|دفعة أولى|دفعة اولى)\s*(?:إلى|الى|=|:)??\s*([0-9][0-9,]*)',
-        'lessons': r'(?:عدد الدروس|الدروس|درس)\s*(?:إلى|الى|=|:)??\s*([0-9][0-9,]*)',
-        'days_per_week': r'(?:أيام بالأسبوع|ايام بالأسبوع|ايام بالاسبوع)\s*(?:إلى|الى|=|:)??\s*([0-9][0-9,]*)',
+        'price': r'(?:السعر|سعر)(?:\s+دورة\s+[^,;]+?)?\s*(?:إلى|الى|=|:)?\s*([0-9][0-9,]*)',
+        'first_payment': r'(?:الدفعة الأولى|الدفعة الاولى|دفعة أولى|دفعة اولى)\s*(?:إلى|الى|=|:)?\s*([0-9][0-9,]*)',
+        'lessons': r'(?:عدد الدروس|الدروس|درس)\s*(?:إلى|الى|=|:)?\s*([0-9][0-9,]*)',
+        'days_per_week': r'(?:أيام بالأسبوع|ايام بالأسبوع|ايام بالاسبوع)\s*(?:إلى|الى|=|:)?\s*([0-9][0-9,]*)',
     }
     for field, pattern in patterns.items():
         found = re.search(pattern, text, flags=re.I)
@@ -58,6 +58,10 @@ def _parse_structured_update(text: str):
 
 
 def parse_admin_command(command_text: str):
+    low = _normalize(command_text).lower()
+    # Rollback must win over the generic "تعديل" detector.
+    if 'تراجع عن' in low or 'رجع' in low:
+        return _ORIGINAL_PARSE(command_text)
     structured = _parse_structured_update(command_text)
     return structured if structured else _ORIGINAL_PARSE(command_text)
 
