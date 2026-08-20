@@ -6,7 +6,6 @@ from typing import Any
 
 POLICY_MARKER = "__ACADEMY_SALES_CONVERSATION_POLICY_V1__"
 
-# Explicit commitment signals. Informational questions deliberately do not match.
 ENROLLMENT_PATTERNS = (
     r"\bبدي\s+(?:سجل|سجّل|احجز|احج|اثبت|ثبت)\b",
     r"\bبدي\s+التسجيل\b",
@@ -15,8 +14,8 @@ ENROLLMENT_PATTERNS = (
     r"\bحاب[ةه]\s+اسجل\b",
     r"\bحاب[ةه]\s+احجز\b",
     r"\bثبتيلي\b",
-    r"\bثبت(?:ي)?\s+(?:لي|لنا|المقعد|المكان|اسمي|التسجيل)\b",
-    r"\bكيف\s+(?:ثبت|اثبت)\s+(?:مقعد|اسمي|التسجيل)\b",
+    r"\bثبت(?:ي)?\s+(?:لي|لنا|المقعد|مقعدي|المكان|اسمي|التسجيل)\b",
+    r"\bكيف\s+(?:ثبت|اثبت)\s+(?:مقعد|مقعدي|اسمي|التسجيل)\b",
     r"\bبدي\s+ثبت\b",
     r"\bبدي\s+ثبّت\b",
     r"\bبدي\s+سجّل\b",
@@ -31,18 +30,8 @@ PAYMENT_QUESTION_PATTERNS = (
 )
 
 BANNED_AFFECTION_TERMS = (
-    "حبيبي",
-    "حبيبتي",
-    "غاليتي",
-    "غالية",
-    "غالي",
-    "يا غالي",
-    "يا غالية",
-    "يا حبيب",
-    "يا حبيبتي",
-    "عيوني",
-    "لعيونك",
-    "تؤبريني",
+    "حبيبي", "حبيبتي", "غاليتي", "غالية", "غالي", "يا غالي", "يا غالية",
+    "يا حبيب", "يا حبيبتي", "عيوني", "لعيونك", "تؤبريني",
 )
 
 REPLACEMENTS = {
@@ -59,6 +48,12 @@ REPLACEMENTS = {
     "لعيونك": "بكل سرور",
     "تؤبريني": "أهلاً بكِ",
 }
+
+PAYMENT_CTA_TERMS = (
+    "شام كاش", "شامكاش", "ثبتّي", "ثبتي", "ثبتلي", "تثبيت", "تثبيت الاسم",
+    "تثبيت المقعد", "تسجيل الاسم", "احجز", "حجز", "سجل", "تسجيل", "الدفعة الأولى",
+    "الدفعة الاولى", "الدفع عن بعد", "ثبت مقعد",
+)
 
 
 def _normalize(text: str) -> str:
@@ -80,7 +75,6 @@ def is_payment_question(user_message: str) -> bool:
 
 
 def should_offer_payment(user_message: str) -> bool:
-    """Allow payment details only on explicit enrollment or direct payment questions."""
     return has_enrollment_intent(user_message) or is_payment_question(user_message)
 
 
@@ -89,6 +83,22 @@ def sanitize_professional_response(text: str) -> str:
     for banned, replacement in REPLACEMENTS.items():
         value = value.replace(banned, replacement)
     return value
+
+
+def guard_response(user_message: str, response_text: str) -> str:
+    value = sanitize_professional_response(response_text)
+    if should_offer_payment(user_message):
+        return value
+
+    parts = re.split(r"(?<=[.!؟\n])\s+", value)
+    kept = []
+    for part in parts:
+        normalized = _normalize(part)
+        if any(term in normalized for term in PAYMENT_CTA_TERMS):
+            continue
+        kept.append(part)
+    cleaned = " ".join(p.strip() for p in kept if p.strip()).strip()
+    return cleaned or "تفضلي، اذكري لي المعلومة التي تودين معرفتها وسأوضحها لكِ بشكل مباشر."
 
 
 SALES_POLICY = r"""
