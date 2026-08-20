@@ -6,7 +6,6 @@ from typing import Any
 
 POLICY_MARKER = "__ACADEMY_SALES_CONVERSATION_POLICY_V1__"
 
-# Explicit commitment signals. Informational questions deliberately do not match.
 ENROLLMENT_PATTERNS = (
     r"\bبدي\s+(?:سجل|سجّل|احجز|احج|اثبت|ثبت)\b",
     r"\bبدي\s+التسجيل\b",
@@ -15,8 +14,8 @@ ENROLLMENT_PATTERNS = (
     r"\bحاب[ةه]\s+اسجل\b",
     r"\bحاب[ةه]\s+احجز\b",
     r"\bثبتيلي\b",
-    r"\bثبت(?:ي)?\s+(?:لي|لنا|المقعد|المكان|اسمي|التسجيل)\b",
-    r"\bكيف\s+(?:ثبت|اثبت)\s+(?:مقعد|اسمي|التسجيل)\b",
+    r"\bثبت(?:ي)?\s+(?:لي|لنا|المقعد|مقعدي|المكان|اسمي|التسجيل)\b",
+    r"\bكيف\s+(?:ثبت|اثبت)\s+(?:مقعد|مقعدي|اسمي|التسجيل)\b",
     r"\bبدي\s+ثبت\b",
     r"\bبدي\s+ثبّت\b",
     r"\bبدي\s+سجّل\b",
@@ -76,7 +75,6 @@ def is_payment_question(user_message: str) -> bool:
 
 
 def should_offer_payment(user_message: str) -> bool:
-    """Allow payment details only on explicit enrollment or direct payment questions."""
     return has_enrollment_intent(user_message) or is_payment_question(user_message)
 
 
@@ -88,12 +86,10 @@ def sanitize_professional_response(text: str) -> str:
 
 
 def guard_response(user_message: str, response_text: str) -> str:
-    """Enforce no-premature-booking rule after Gemini generation as a deterministic safety net."""
     value = sanitize_professional_response(response_text)
     if should_offer_payment(user_message):
         return value
 
-    # Remove complete sentences that introduce booking/payment without user commitment.
     parts = re.split(r"(?<=[.!؟\n])\s+", value)
     kept = []
     for part in parts:
