@@ -5,6 +5,8 @@ import re
 
 import admin_runtime as base
 
+_ORIGINAL_PARSE = base.parse_admin_command
+
 
 def _normalize(text: str) -> str:
     value = (text or '').strip()
@@ -17,25 +19,36 @@ def _parse_structured_update(text: str):
     low = _normalize(text).lower()
     if not ('غير' in low or 'عدل' in low or 'تعديل' in low) or 'دورة' not in low:
         return None
-    match = re.search(r'دورة\s+(.+?)(?=\s+(?:الى|إلى|السعر|سعر|الدفعة|دفعة|الدروس|عدد الدروس|المحاور|محاور|مدة|تبدأ|تبدا)|[,;]|$)', text, flags=re.I)
+    match = re.search(
+        r'دورة\s+(.+?)(?=\s+(?:الى|إلى|السعر|سعر|الدفعة|دفعة|الدروس|عدد الدروس|المحاور|محاور|مدة|تبدأ|تبدا)|[,;]|$)',
+        text,
+        flags=re.I,
+    )
     if not match:
         return None
-    name = match.group(1).strip(' .،,')
-    args = {'name': name}
+    args = {'name': match.group(1).strip(' .،,')}
     patterns = {
-        'price': r'(?:السعر|سعر)\s*(?:إلى|الى|=|:)??\s*([0-9][0-9,]*)',
+        'price': r'(?:السعر|سعر)(?:\s+دورة\s+[^,;]+?)?\s*(?:إلى|الى|=|:)??\s*([0-9][0-9,]*)',
         'first_payment': r'(?:الدفعة الأولى|الدفعة الاولى|دفعة أولى|دفعة اولى)\s*(?:إلى|الى|=|:)??\s*([0-9][0-9,]*)',
         'lessons': r'(?:عدد الدروس|الدروس|درس)\s*(?:إلى|الى|=|:)??\s*([0-9][0-9,]*)',
         'days_per_week': r'(?:أيام بالأسبوع|ايام بالأسبوع|ايام بالاسبوع)\s*(?:إلى|الى|=|:)??\s*([0-9][0-9,]*)',
     }
     for field, pattern in patterns.items():
-        m = re.search(pattern, text, flags=re.I)
-        if m:
-            args[field] = int(re.sub(r'[^0-9]', '', m.group(1)))
-    duration = re.search(r'(?:مدة الدرس|مدة)\s*(?:إلى|الى|=|:)?\s*([^,;]+?)(?=\s+و(?:غير|عدل)|,|;|$)', text, flags=re.I)
+        found = re.search(pattern, text, flags=re.I)
+        if found:
+            args[field] = int(re.sub(r'[^0-9]', '', found.group(1)))
+    duration = re.search(
+        r'(?:مدة الدرس|مدة)\s*(?:إلى|الى|=|:)?\s*([^,;]+?)(?=\s+و(?:غير|عدل)|,|;|$)',
+        text,
+        flags=re.I,
+    )
     if duration:
         args['duration_text'] = duration.group(1).strip()
-    topics = re.search(r'(?:المحاور|محاور)\s*(?:إلى|الى|=|:)?\s*([^,;]+?)(?=\s+و(?:غير|عدل)|,|;|$)', text, flags=re.I)
+    topics = re.search(
+        r'(?:المحاور|محاور)\s*(?:إلى|الى|=|:)?\s*([^,;]+?)(?=\s+و(?:غير|عدل)|,|;|$)',
+        text,
+        flags=re.I,
+    )
     if topics:
         args['topics'] = topics.group(1).strip()
     date_match = re.search(r'(20\d{2}[-/]\d{1,2}[-/]\d{1,2})', text)
@@ -46,9 +59,7 @@ def _parse_structured_update(text: str):
 
 def parse_admin_command(command_text: str):
     structured = _parse_structured_update(command_text)
-    if structured:
-        return structured
-    return base.parse_admin_command(command_text)
+    return structured if structured else _ORIGINAL_PARSE(command_text)
 
 
 def upsert_lead(app, sender_id: str, message: str):
