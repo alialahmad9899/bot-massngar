@@ -15,7 +15,7 @@ def sanitize_professional_response(text: str) -> str:
 
 
 def has_handover_intent(text: str) -> bool:
-    return runtime.handover(text)
+    return runtime.handover(text) or bool(__import__("re").search(r"خلي\s+حدا\s+من\s+الادارة\s+(?:يتواصل|يحكي)\s+معي", runtime.normalize(text)))
 
 
 def is_human_page_echo(event: dict, bot_sent_mids: dict | None = None) -> bool:
@@ -71,7 +71,7 @@ def _wrap_process(app_module, original):
             return original(event_payload, event_id=event_id)
         text = (message.get("text") or "").strip()
         sender = (event_payload.get("sender") or {}).get("id")
-        if sender and runtime.handover(text):
+        if sender and has_handover_intent(text):
             app_module.set_handover_status(sender, 1)
             if callable(getattr(app_module, "send_facebook_message", None)):
                 app_module.send_facebook_message(sender, "تم تحويل المحادثة لفريق المتابعة. من الآن سيتولى أحد أعضاء الفريق التواصل معكِ مباشرة.")
