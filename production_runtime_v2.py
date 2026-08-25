@@ -1,1 +1,1 @@
-[rollback via branch reset pending]
+[ROLLBACK NOW]
