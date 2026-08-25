@@ -3,11 +3,14 @@ import hmac
 import importlib.util
 import os
 import sqlite3
-import tempfile
 from pathlib import Path
 
 
-def load_module(path: str):
+def app_path() -> str:
+    return str(Path(__file__).with_name("app.py"))
+
+
+def load_module(path: str | None = None):
     import sys, types
     flask = types.ModuleType('flask')
     class DummyRequest: pass
@@ -18,6 +21,7 @@ def load_module(path: str):
     requests.RequestException = Exception
     class DummySession:
         def post(self, *a, **k): return type('R', (), {'status_code': 200, 'text': ''})()
+        def get(self, *a, **k): return type('R', (), {'status_code': 200, 'text': '', 'json': lambda self: {'data': []}})()
     requests.Session = DummySession
     sys.modules['requests'] = requests
     google = types.ModuleType('google')
@@ -33,15 +37,14 @@ def load_module(path: str):
     os.environ['VERIFY_TOKEN'] = 'test-verify'
     os.environ['APP_SECRET'] = 'test-app-secret'
     os.environ['ADMIN_PASSWORD'] = 'test-admin-password'
-    spec = importlib.util.spec_from_file_location('academy_bot', path)
+    spec = importlib.util.spec_from_file_location('academy_bot_test', path or app_path())
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def test_all_production_secrets_are_required(tmp_path):
-    src = Path('/mnt/data/academy_bot_production.py')
-    text = src.read_text(encoding='utf-8')
+def test_all_production_secrets_are_required():
+    text = Path(app_path()).read_text(encoding='utf-8')
     assert 'ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")' in text
     assert 'APP_SECRET = os.environ.get("APP_SECRET")' in text
     assert 'VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")' in text
@@ -50,7 +53,7 @@ def test_all_production_secrets_are_required(tmp_path):
 
 
 def test_meta_signature_is_verified_against_raw_body():
-    mod = load_module('/mnt/data/academy_bot_production.py')
+    mod = load_module()
     secret = b'test-app-secret'
     body = b'{"object":"page","entry":[]}'
     expected = 'sha256=' + hmac.new(secret, body, hashlib.sha256).hexdigest()
@@ -60,7 +63,7 @@ def test_meta_signature_is_verified_against_raw_body():
 
 
 def test_deduplication_is_atomic_and_ttl_prunes():
-    mod = load_module('/mnt/data/academy_bot_production.py')
+    mod = load_module()
     mod.PROCESSED_MESSAGES.clear()
     assert mod.is_duplicate_message('m1') is False
     assert mod.is_duplicate_message('m1') is True
@@ -70,7 +73,7 @@ def test_deduplication_is_atomic_and_ttl_prunes():
 
 
 def test_admin_compare_and_lockout():
-    mod = load_module('/mnt/data/academy_bot_production.py')
+    mod = load_module()
     mod.ADMIN_ATTEMPTS.clear()
     assert mod.verify_admin_password('test-admin-password') is True
     assert mod.verify_admin_password('wrong') is False
@@ -82,12 +85,12 @@ def test_admin_compare_and_lockout():
 
 
 def test_bounded_queue_does_not_grow_without_limit():
-    mod = load_module('/mnt/data/academy_bot_production.py')
+    mod = load_module()
     assert mod.MESSAGE_QUEUE.maxsize == 100
 
 
 def test_sqlite_schema_has_webhook_inbox(tmp_path):
-    mod = load_module('/mnt/data/academy_bot_production.py')
+    mod = load_module()
     mod.DB_PATH = str(tmp_path / 'academy.sqlite3')
     mod.init_db()
     conn = sqlite3.connect(mod.DB_PATH)
