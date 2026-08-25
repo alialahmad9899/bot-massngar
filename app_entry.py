@@ -39,6 +39,11 @@ def _strict_handover(text: str) -> bool:
 
 production_runtime_v2.sanitize = _strict_sanitize
 production_runtime_v2.handover = _strict_handover
+
+# ``production_runtime_v2`` operates on the ``app`` module's shared state,
+# while its webhook installation needs Flask's view registry. Expose that
+# registry on the module without changing the runtime's established contract.
+app_module.view_functions = app_module.app.view_functions
 production_runtime_v2.bootstrap(app_module)
 
 # Canonical WSGI object exported for Gunicorn/Render.
