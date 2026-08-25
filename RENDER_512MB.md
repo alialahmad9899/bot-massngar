@@ -10,27 +10,52 @@
 
 لا يوجد Default آمن لأي Secret. التطبيق يرفض الإقلاع إذا نقص أحدها.
 
-## أمر التشغيل المقترح
+## أمر التشغيل المعتمد
 
 ```bash
-gunicorn academy_bot_production:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 30
+gunicorn --workers 1 --threads 2 app_entry:app
 ```
 
-استخدم Worker واحد فقط في Render 512MB، لأن التطبيق نفسه يشغّل عاملَي معالجة داخليين بحد أقصى للحفاظ على ترتيب الرسائل وتقليل استهلاك RAM.
+لا تستخدم `app:app` في الإنتاج الجديد؛ `app_entry.py` يحمّل الـUnified Production Runtime قبل استقبال الطلبات.
 
-## ملاحظة مهمة عن SQLite
+Render يعمل بWorker Gunicorn واحد، بينما التطبيق نفسه يشغّل عاملَي معالجة داخليين كحد أقصى للحفاظ على ترتيب الرسائل وتقليل استهلاك RAM.
 
-النسخة تستخدم SQLite WAL وInbox داخلياً لتقليل فقدان الرسائل عند امتلاء Queue أو حدوث أخطاء مؤقتة.
-للاستمرار بعد إعادة إنشاء Instance في Render، يجب وضع `DB_PATH` على Render Persistent Disk، مثلاً:
+## SQLite والاستمرارية
+
+التطبيق يستخدم SQLite WAL وDurable Webhook Inbox وIdempotent Response Tracking.
+إذا كان Render Persistent Disk مركباً على `/var/data`، سينقل runtime قاعدة البيانات إلى:
 
 ```text
-/mnt/data/academy_bot.db
+/var/data/academy_bot.db
 ```
 
-ثم ضبط:
+ويستخدمها تلقائياً.
+
+إذا لم يكن هناك Persistent Disk، تبقى SQLite على filesystem المؤقتة في Render، وبالتالي يمكن أن تضيع المحادثات والدورات والمواعيد وCRM عند إعادة إنشاء Instance.
+
+## اختبارات النشر
+
+قبل اعتبار الإصدار Production-ready، يجب أن يكون GitHub Actions أخضر لكل:
+
+- Hardening
+- Admin/CRM
+- Language/Conversation
+- Human Handover
+- Unified Production Runtime
+
+كما يجب بعد Deploy التحقق من:
 
 ```text
-DB_PATH=/mnt/data/academy_bot.db
+GET /health
+POST /webhook
 ```
 
-بدون Persistent Disk، أي قاعدة SQLite على filesystem المؤقتة في Render قد تضيع عند إعادة إنشاء الـInstance.
+ومراقبة Logs الخاصة بـ:
+
+```text
+[RUNTIME] unified v2 ready
+[WORKER-1] started
+[WORKER-2] started
+[WEBHOOK] durable
+[EVENT] completed
+```
