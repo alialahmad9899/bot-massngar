@@ -1,1 +1,1 @@
-[ROLLBACK NOW]
+[ABORT]
