@@ -21,10 +21,10 @@ jobs:
       - name: Install test runner
         run: python -m pip install --upgrade pytest
       - name: Compile production Python files
-        run: python -m py_compile app.py app_entry.py production_runtime_v2.py gunicorn.conf.py
+        run: python -m py_compile app.py app_entry.py production_runtime_v2.py handover_gate.py gunicorn.conf.py
       - name: Run hardening and admin tests
         run: python -m pytest -q test_app_hardening.py test_admin_tools.py test_admin_command_center_v2.py
       - name: Run sales and language tests
         run: python -m pytest -q test_sales_conversation_policy.py test_sales_runtime.py test_human_handover_runtime.py test_sales_language_guide.py
       - name: Run unified production runtime tests
-        run: python -m pytest -q test_production_runtime_v2.py
+        run: python -m pytest -q test_production_runtime_v2.py test_human_handover_gate.py
