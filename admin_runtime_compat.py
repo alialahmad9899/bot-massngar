@@ -53,10 +53,10 @@ def parse_admin_command(command_text: str) -> dict:
     normalized = _normalize(command_text)
     low = normalized.lower()
     if "تراجع عن" in low or "رجع" in low:
-        m = re.search(r"دورة\s+(.+)$", normalized)
-        name = m.group(1).strip() if m else None
+        m = re.search(r"دورة\s+(.+)$", command_text.strip())
+        name = m.group(1).strip(" .،,") if m else None
         return {"tool": "rollback_course", "args": {"name": name}}
-    structured = _parse_update_course(normalized)
+    structured = _parse_update_course(command_text)
     if structured:
         return structured
     return base.parse_admin_command(normalized)
