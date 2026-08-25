@@ -24,3 +24,5 @@ jobs:
         run: python -m pytest -q test_admin_command_center_v2.py
       - name: Run sales and language tests
         run: python -m pytest -q test_sales_conversation_policy.py test_sales_runtime.py test_human_handover_runtime.py test_sales_language_guide.py
+      - name: Run unified production runtime tests
+        run: python -m pytest -q test_production_runtime_v2.py
