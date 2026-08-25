@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import sys
 
-from app import app
+import app as app_module
 import admin_runtime_compat
 import production_runtime_v2
 import handover_gate
@@ -39,7 +39,11 @@ def _strict_handover(text: str) -> bool:
 
 production_runtime_v2.sanitize = _strict_sanitize
 production_runtime_v2.handover = _strict_handover
-production_runtime_v2.bootstrap(app)
+production_runtime_v2.bootstrap(app_module)
+
+# Canonical WSGI object exported for Gunicorn/Render.
+app = app_module.app
+
 # Final safety boundary: no bot message can leave the process while a human owns the conversation.
 handover_gate.install(app)
 
