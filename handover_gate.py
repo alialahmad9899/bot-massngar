@@ -33,7 +33,6 @@ def handover_gate(is_paused: Callable[[], bool]) -> bool:
     try:
         return not bool(is_paused())
     except Exception:
-        # Fail closed: a handover-state read failure must not let the bot talk.
         return False
 
 
@@ -51,29 +50,36 @@ def is_handover_notice(text: str | None) -> bool:
 
 
 def install(app: Any) -> Any:
-    """Install the last-mile send gate on the live Flask app."""
+    """Install the last-mile handover gate on the live Flask app."""
     marker = "_HANDOVER_SEND_GATE_INSTALLED"
     if getattr(app, marker, False):
         return app
 
     original_send = app.send_facebook_message
+    original_set_handover = app.set_handover_status
+    generation = HandoverGeneration()
     local = threading.local()
+    app.handover_generation = generation
+
+    def set_handover_with_generation(sender_id, status=1):
+        result = original_set_handover(sender_id, status)
+        generation.bump()
+        return result
 
     def send_with_gate(recipient_id, message_text, quick_replies=None):
         bypass = bool(getattr(local, "bypass", False))
-        allowed = bypass or is_handover_notice(message_text)
-        if not allowed:
-            allowed = handover_gate(lambda: app.is_user_paused(recipient_id))
-        if not allowed:
+        if bypass or is_handover_notice(message_text):
+            return original_send(recipient_id, message_text, quick_replies)
+
+        snapshot = generation.snapshot()
+        if not handover_gate(lambda: app.is_user_paused(recipient_id)):
             print(f"[HANDOVER-GATE] blocked bot send user={recipient_id}", flush=True)
-            try:
-                from production_runtime_v2 import CURRENT_EVENT
-                setattr(CURRENT_EVENT, "response_suppressed", True)
-            except Exception:
-                pass
-            # True means "handled" to the durable worker: the message is
-            # intentionally suppressed, not a transport failure to retry.
             return True
+
+        if not generation.is_current(snapshot) or not handover_gate(lambda: app.is_user_paused(recipient_id)):
+            print(f"[HANDOVER-GATE] blocked stale response user={recipient_id}", flush=True)
+            return True
+
         return original_send(recipient_id, message_text, quick_replies)
 
     def send_bypassing_gate(recipient_id, message_text, quick_replies=None):
@@ -84,6 +90,7 @@ def install(app: Any) -> Any:
         finally:
             local.bypass = previous
 
+    app.set_handover_status = set_handover_with_generation
     app.send_facebook_message = send_with_gate
     app.send_facebook_message_bypass_handover_gate = send_bypassing_gate
     setattr(app, marker, True)
