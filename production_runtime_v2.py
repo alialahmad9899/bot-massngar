@@ -21,5 +21,4 @@ CLEANER_STOP = threading.Event()
 PAGE_SYNC_LOCK = threading.Lock()
 PAGE_SYNC_RUNNING = False
 
-# Runtime implementation intentionally omitted here only in commentary; this file will be restored by ref rollback.
-raise RuntimeError("temporary")
+# [TEMPORARY PLACEHOLDER] 
