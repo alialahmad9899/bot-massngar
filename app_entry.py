@@ -1,12 +1,7 @@
-"""Production WSGI entrypoint.
-
-Imports the legacy application, then installs the single unified runtime before
-Gunicorn begins serving requests.
-"""
-
+"""Production WSGI entrypoint."""
 from app import app
-import production_runtime
+import production_runtime_v2
 
-production_runtime.bootstrap(app)
+production_runtime_v2.bootstrap(app)
 
 __all__ = ["app"]
