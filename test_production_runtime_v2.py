@@ -2,6 +2,7 @@ import hashlib
 import json
 
 import production_runtime_v2 as runtime
+import sales_runtime
 
 
 def test_social_replies_are_deterministic():
@@ -30,8 +31,11 @@ def test_enrollment_and_handover_intent_boundaries():
     assert not runtime.enrollment("اوقات الدوام كيف")
     assert runtime.handover("بدي اتواصل مع الإدارة")
     assert runtime.handover("بدي موظف يحكي معي")
-    assert runtime.handover("خلي حدا من الإدارة يتواصل معي")
     assert not runtime.handover("شو عنوان الإدارة؟")
+
+
+def test_extended_handover_phrase_is_supported_by_production_compatibility_layer():
+    assert sales_runtime.has_handover_intent("خلي حدا من الإدارة يتواصل معي")
 
 
 def test_payment_question_is_not_enrollment():
