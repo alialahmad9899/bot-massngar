@@ -10,6 +10,11 @@ def post_worker_init(worker):
         import app as app_module
         import production_runtime_v2
 
+        # Runtime code installs the webhook through ``app.view_functions``.
+        # In the Python module, expose Flask's registry under that established
+        # name without changing the runtime's module-level state contract.
+        app_module.view_functions = app_module.app.view_functions
+
         if not getattr(app_module, production_runtime_v2.RUNTIME_MARKER, False):
             production_runtime_v2.bootstrap(app_module)
     except Exception as exc:
