@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import re
+import sys
 
 from app import app
+import admin_runtime_compat
 import production_runtime_v2
+
+# Production and tests use the same canonical admin backend.
+sys.modules["admin_runtime"] = admin_runtime_compat
 
 _original_sanitize = production_runtime_v2.sanitize
 _original_handover = production_runtime_v2.handover
