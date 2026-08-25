@@ -20,6 +20,8 @@ jobs:
           python-version: '3.12'
       - name: Install test runner
         run: python -m pip install --upgrade pytest
+      - name: Compile production Python files
+        run: python -m py_compile app.py app_entry.py production_runtime_v2.py gunicorn.conf.py
       - name: Run structured admin/CRM tests
         run: python -m pytest -q test_admin_command_center_v2.py
       - name: Run sales and language tests
