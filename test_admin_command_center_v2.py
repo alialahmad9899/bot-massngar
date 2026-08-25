@@ -1,11 +1,10 @@
-import importlib.util
-import os
 import sqlite3
-import sys
 import types
 
 
 def load_runtime(tmp_path):
+    import admin_runtime_compat as runtime
+
     app = types.SimpleNamespace()
     app.DB_PATH = str(tmp_path / "academy.sqlite3")
     app.DB_LOCK = __import__("threading").RLock()
@@ -25,14 +24,8 @@ def load_runtime(tmp_path):
     conn.execute("""CREATE TABLE admin_pending_actions(
         sender_id TEXT PRIMARY KEY, action_json TEXT NOT NULL, expires_at REAL NOT NULL, created_at TEXT)""")
     conn.commit(); conn.close()
-
-    module_path = os.path.join(os.path.dirname(__file__), "admin_runtime.py")
-    spec = importlib.util.spec_from_file_location("admin_runtime", module_path)
-    base = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(base)
-    sys.modules["admin_runtime"] = base
-    base.init_extension_schema(app)
-    return base, None, app
+    runtime.init_extension_schema(app)
+    return runtime, None, app
 
 
 def test_parse_update_course_is_structured(tmp_path):
