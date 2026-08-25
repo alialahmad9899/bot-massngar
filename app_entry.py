@@ -7,6 +7,7 @@ import sys
 from app import app
 import admin_runtime_compat
 import production_runtime_v2
+import handover_gate
 
 # Production and tests use the same canonical admin backend.
 sys.modules["admin_runtime"] = admin_runtime_compat
@@ -39,5 +40,7 @@ def _strict_handover(text: str) -> bool:
 production_runtime_v2.sanitize = _strict_sanitize
 production_runtime_v2.handover = _strict_handover
 production_runtime_v2.bootstrap(app)
+# Final safety boundary: no bot message can leave the process while a human owns the conversation.
+handover_gate.install(app)
 
 __all__ = ["app"]
