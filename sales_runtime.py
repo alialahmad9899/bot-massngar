@@ -1,8 +1,4 @@
-"""Compatibility shim for the unified production runtime.
-
-Production uses production_runtime_v2 directly. This module remains only so old
-imports/tests resolve to the same canonical behavior.
-"""
+"""Compatibility shim for the unified production runtime."""
 from __future__ import annotations
 
 import production_runtime_v2 as runtime
@@ -89,7 +85,7 @@ def apply_patch(app_module=None):
         import app as app_module
     if getattr(app_module, PATCH_MARKER, False):
         return app_module
-    app_module.SYSTEM_INSTRUCTION = app_module.SYSTEM_INSTRUCTION + "\n\n" + runtime.SYRIAN_GUIDE
+    app_module.SYSTEM_INSTRUCTION = app_module.SYSTEM_INSTRUCTION + "\n\n=== دليل الكتابة السورية العامية المهنية ===\n" + runtime.SYRIAN_GUIDE
     original_history = getattr(app_module, "get_user_history_db", None)
     original_generate = getattr(app_module, "generate_ai_reply", None)
     original_process = getattr(app_module, "process_single_message", None)
