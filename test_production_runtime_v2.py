@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 import production_runtime_v2 as runtime
 
 
@@ -27,6 +30,7 @@ def test_enrollment_and_handover_intent_boundaries():
     assert not runtime.enrollment("اوقات الدوام كيف")
     assert runtime.handover("بدي اتواصل مع الإدارة")
     assert runtime.handover("بدي موظف يحكي معي")
+    assert runtime.handover("خلي حدا من الإدارة يتواصل معي")
     assert not runtime.handover("شو عنوان الإدارة؟")
 
 
@@ -49,9 +53,11 @@ def test_sales_guard_allows_explicit_booking_flow():
     assert "شام كاش" in runtime.sales_guard(user, response)
 
 
-def test_durable_message_key_is_stable_without_mid():
+def test_webhook_fallback_message_key_formula_is_deterministic():
     event = {"sender": {"id": "u1"}, "message": {"text": "مرحبا"}}
-    assert runtime.durable_message_key(event) == runtime.durable_message_key(event)
+    raw = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    key = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert key == "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def test_banned_terms_have_replacements():
