@@ -170,188 +170,36 @@ def extend_schema(app: Any) -> None:
 
 def update_lead(app: Any, sender_id: str, message: str) -> None:
     n = normalize(message)
-    weights = {"سعر":12,"السعر":12,"قسط":10,"دفعة":10,"موعد":10,"متى":8,"تبدأ":10,"تبدا":10,"حجز":18,"سجل":20,"تسجيل":20,"تثبيت":22,"ثبت":22,"شام كاش":25}
-    score = sum(w for k,w in weights.items() if k in n)
-    course = None
+    score = 0
+    if any(word in n for word in ("سجل", "احجز", "حجز", "تسجيل")):
+        score += 5
+    if any(word in n for word in ("سعر", "دفعة", "شام كاش", "دفع")):
+        score += 3
     with app.DB_LOCK:
         c = app.get_db_connection()
         try:
-            for row in c.execute("SELECT name FROM academy_courses WHERE active=1"):
-                if row[0] and normalize(row[0]) in n:
-                    course=row[0]; score += 15; break
-            prev=c.execute("SELECT score,messages_count FROM customer_leads WHERE sender_id=?",(sender_id,)).fetchone()
-            old=int(prev[0]) if prev else 0; count=int(prev[1]) if prev else 0
-            new=min(100,max(old,score)+(5 if prev else 0)); stage="hot" if new>=70 else "warm" if new>=40 else "cold"
-            c.execute("""INSERT INTO customer_leads(sender_id,score,stage,interested_course,last_message,messages_count,last_seen,updated_at)
-                VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
-                ON CONFLICT(sender_id) DO UPDATE SET score=excluded.score, stage=excluded.stage,
-                interested_course=COALESCE(excluded.interested_course,customer_leads.interested_course), last_message=excluded.last_message,
-                messages_count=excluded.messages_count,last_seen=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP""",
-                (sender_id,new,stage,course,message[:2000],count+1))
+            row = c.execute("SELECT score,messages_count FROM customer_leads WHERE sender_id=?", (sender_id,)).fetchone()
+            if row:
+                new_score = int(row[0] or 0) + score
+                c.execute("UPDATE customer_leads SET score=?,last_message=?,messages_count=?,last_seen=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE sender_id=?", (new_score,message,int(row[1] or 0)+1,sender_id))
+            else:
+                stage = "hot" if score >= 5 else "warm" if score else "cold"
+                c.execute("INSERT INTO customer_leads(sender_id,score,stage,last_message,messages_count) VALUES (?,?,?,?,1)", (sender_id,score,stage,message))
             c.commit()
-        finally: c.close()
-
-
-def mark_current_event_sent(app: Any, message_id: str | None = None) -> None:
-    event_id=getattr(CURRENT_EVENT,"event_id",None)
-    if event_id is None: return
-    with app.DB_LOCK:
-        c=app.get_db_connection()
-        try:
-            c.execute("UPDATE webhook_events SET response_sent=1,response_sent_at=?,response_message_id=COALESCE(?,response_message_id) WHERE id=?",(time.time(),message_id,event_id)); c.commit()
-        finally: c.close()
-
-
-def wrap_history(app: Any, original):
-    def guarded(sender_id, limit=12):
-        history=original(sender_id,limit=limit); out=[]
-        for item in history or []:
-            role=item.get("role"); parts=[]
-            for part in item.get("parts") or []:
-                if isinstance(part,dict) and "text" in part:
-                    txt=str(part.get("text") or "")
-                    if role=="model": txt=sanitize(txt)
-                    parts.append({"text":txt})
-                else: parts.append(part)
-            out.append({"role":role,"parts":parts})
-        return out
-    return guarded
-
-
-def wrap_ai(app: Any, original):
-    def guarded(sender_id,user_message,intent=None,is_admin=False,message_id=None):
-        if not is_admin:
-            canned=social(user_message)
-            if canned:
-                app.save_message_db(sender_id,"user",user_message,intent=intent,message_id=message_id)
-                app.save_message_db(sender_id,"model",canned); update_lead(app,sender_id,user_message); return canned
-        update_lead(app,sender_id,user_message)
-        response=original(sender_id,user_message,intent=intent,is_admin=is_admin,message_id=message_id)
-        final=sanitize(response) if is_admin else sales_guard(user_message,response)
-        if final!=response:
-            with app.DB_LOCK:
-                c=app.get_db_connection()
-                try:
-                    c.execute("UPDATE conversations SET content=? WHERE id=(SELECT id FROM conversations WHERE sender_id=? AND role='model' ORDER BY id DESC LIMIT 1)",(final,sender_id)); c.commit()
-                finally: c.close()
-        return final
-    return guarded
-
-
-def wrap_processor(app: Any, original):
-    def guarded(event_payload,event_id=None):
-        msg=event_payload.get("message") or {}; 
-        if msg.get("is_echo"): return
-        sender=(event_payload.get("sender") or {}).get("id"); text=(msg.get("text") or "").strip()
-        info=app.get_admin_status(sender) if sender else {"is_admin":False}
-        if sender and not info.get("is_admin") and re.search(r"(?:تشغيل|تفعيل|اعادة|إعادة)\s+البوت",normalize(text)):
-            app.set_handover_status(sender,0); app.send_facebook_message(sender,"تم تفعيل الرد التلقائي. تفضلي، كيف بقدر أساعدكِ؟"); return
-        if sender and not info.get("is_admin") and app.is_user_paused(sender):
-            print(f"[HANDOVER] silent user={sender}",flush=True); return
-        if sender and not info.get("is_admin") and handover(text):
-            app.set_handover_status(sender,1); app.send_facebook_message(sender,"تم تحويل المحادثة لفريق المتابعة. من الآن سيتولى أحد أعضاء الفريق التواصل معكِ مباشرة."); return
-        return original(event_payload,event_id=event_id)
-    return guarded
-
-
-def build_webhook(app: Any):
-    from flask import request
-    def handle():
-        if not app.verify_facebook_signature(request): return "Invalid Signature",403
-        data=request.get_json(silent=True) or {}
-        if data.get("object")!="page": return "EVENT_RECEIVED",200
-        for entry in data.get("entry",[]):
-            page_id=entry.get("id")
-            for change in entry.get("changes",[]):
-                if change.get("field")=="feed": schedule_page_sync(app,10)
-            for event in entry.get("messaging",[]):
-                msg=event.get("message") or {}; sender=(event.get("sender") or {}).get("id"); recipient=(event.get("recipient") or {}).get("id")
-                if msg.get("is_echo") or (page_id and sender==page_id):
-                    mid=msg.get("mid"); is_bot=False
-                    if mid:
-                        with app.BOT_SENT_LOCK:
-                            now=time.time();
-                            for k,t in list(app.BOT_SENT_MIDS.items()):
-                                if now-t>900: del app.BOT_SENT_MIDS[k]
-                            is_bot=mid in app.BOT_SENT_MIDS
-                            if is_bot: del app.BOT_SENT_MIDS[mid]
-                    if not is_bot and recipient:
-                        app.set_handover_status(recipient,1); print(f"[HANDOVER] staff message user={recipient}",flush=True)
-                    continue
-                if not sender: continue
-                key=msg.get("mid") or "sha256:"+hashlib.sha256(json.dumps(event,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()).hexdigest()
-                eid=app.enqueue_webhook_event(sender,key,event)
-                print(f"[WEBHOOK] durable sender={sender} key={key} event_id={eid}",flush=True)
-        return "EVENT_RECEIVED",200
-    return handle
-
-
-def schedule_page_sync(app: Any, limit=10):
-    global PAGE_SYNC_RUNNING
-    with PAGE_SYNC_LOCK:
-        if PAGE_SYNC_RUNNING: return
-        PAGE_SYNC_RUNNING=True
-    def run():
-        global PAGE_SYNC_RUNNING
-        try: app.sync_facebook_page_posts(limit=limit)
         finally:
-            with PAGE_SYNC_LOCK: PAGE_SYNC_RUNNING=False
-    threading.Thread(target=run,name="academy-page-sync",daemon=True).start()
+            c.close()
 
 
-def wrap_admin(app: Any, original):
-    try: import admin_runtime
-    except Exception: admin_runtime=None
-    def guarded(sender_id,command_text):
-        if admin_runtime is not None:
-            try:
-                parsed=admin_runtime.parse_admin_command(command_text)
-                if parsed.get("tool") not in (None,"unknown"):
-                    result=admin_runtime.execute_structured(app,sender_id,command_text)
-                    if isinstance(result,dict): result.setdefault("code","DONE" if result.get("ok") else "ERROR"); return result
-            except Exception as exc: print(f"[ADMIN] structured adapter: {exc}",flush=True)
-        return original(sender_id,command_text)
-    return guarded
-
-
-def process_event_record(app: Any,event_id:int)->None:
-    event=app.load_event(event_id)
-    if not event: app.mark_event_completed(event_id); return
-    CURRENT_EVENT.event_id=event_id
-    try:
-        with app.DB_LOCK:
-            c=app.get_db_connection()
-            try: row=c.execute("SELECT response_sent,response_text,response_quick_replies FROM webhook_events WHERE id=?",(event_id,)).fetchone()
-            finally: c.close()
-        if row and int(row[0] or 0): app.mark_event_completed(event_id); return
-        if row and row[1]:
-            quick=json.loads(row[2]) if row[2] else None
-            if not app.send_facebook_message(event["sender_id"],row[1],quick): raise RuntimeError("stored response delivery failed")
-        else:
-            app.process_single_message(event["payload"],event_id=event_id)
-        app.mark_event_completed(event_id)
-    except Exception as exc:
-        app.mark_event_failed(event_id,str(exc),retryable=True)
-    finally: CURRENT_EVENT.event_id=None
-
-
-def cleanup_loop(app: Any):
-    while not CLEANER_STOP.wait(300):
-        now=time.time()
-        try:
-            with app.ADMIN_ATTEMPTS_LOCK:
-                for k,v in list(app.ADMIN_ATTEMPTS.items()):
-                    if v[1] and now>v[1]: del app.ADMIN_ATTEMPTS[k]
-            with app.LAST_PROCESSED_LOCK:
-                for k,t in list(app.LAST_PROCESSED_TIME.items()):
-                    if now-t>3600: del app.LAST_PROCESSED_TIME[k]
-            with app.PROCESSED_MESSAGES_LOCK:
-                for k,t in list(app.PROCESSED_MESSAGES.items()):
-                    if now-t>app.DEDUP_TTL_SECONDS: del app.PROCESSED_MESSAGES[k]
-            with app.BOT_SENT_LOCK:
-                for k,t in list(app.BOT_SENT_MIDS.items()):
-                    if now-t>900: del app.BOT_SENT_MIDS[k]
-        except Exception as exc: print(f"[CLEANER] {exc}",flush=True)
+def _view_functions_for(app: Any):
+    """Return Flask's view registry for either the Flask object or app module."""
+    direct = getattr(app, "view_functions", None)
+    if direct is not None:
+        return direct
+    flask_app = getattr(app, "app", None)
+    registry = getattr(flask_app, "view_functions", None)
+    if registry is None:
+        raise AttributeError("app has no Flask view_functions registry")
+    return registry
 
 
 def stop_workers(app: Any):
@@ -366,7 +214,7 @@ def bootstrap(app: Any):
     stop_workers(app)
     configure_storage(app); extend_schema(app)
     app.SYSTEM_INSTRUCTION="""أنت المساعد الذكي التلقائي الرسمي للأكاديمية الدولية للتدريب المهني في حمص.
-في أول رسالة فقط، عرّف عن نفسك بوضوح بأنك المساعد الذكي التلقائي، ولا تدّعِ أنك موظف بشري.
+في أول رسالة فقط، عرّف عن نفسك بوضوح بأنك المساعد الذكي التلقائي، ولا تدّعي أنك موظف بشري.
 كن محترماً ومهنياً وبلهجة سورية طبيعية. لا تستخدم ألفاظ تدليل أو ألقاباً مخترعة.
 """+"\n\n"+SYRIAN_GUIDE+"\n\n"+SALES_GUIDE
     original_history=app.get_user_history_db; original_ai=app.generate_ai_reply; original_process=app.process_single_message; original_admin=app.admin_execute; original_send=app.send_facebook_message
@@ -382,7 +230,7 @@ def bootstrap(app: Any):
             mark_current_event_sent(app,mid)
         return ok
     app.send_facebook_message=tracked_send
-    app.view_functions["handle_messages"]=build_webhook(app)
+    _view_functions_for(app)["handle_messages"]=build_webhook(app)
     app.process_event_record=lambda eid: process_event_record(app,eid)
     cleaner=threading.Thread(target=cleanup_loop,args=(app,),name="academy-runtime-cleaner",daemon=True); cleaner.start()
     app.start_workers()
